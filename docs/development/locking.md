@@ -95,7 +95,7 @@ flight — see its row below.
 | --- | --- | --- |
 | `bootstrap` | First-run CA generation; seeding supporting state (CRL/inventory/serial) for a mounted cert+key; whole-store migration | `CA.Init`, `CA.seedSupportingState`, `storage.MigrateService` (which reuses the name deliberately so a migration and a bootstrapping server exclude each other) |
 | `crl` | Every CRL read-modify-write (read entries → re-sign → write), **and** the pending-supersession list's read-modify-write, which has to be mutual with the revocations it schedules | `Revoke`, `RevokeSerial`, `ReissueCRL`, `RefreshCRLIfDue`, `CleanupExpiredCerts`, `RefreshCRLChainFile` (the `crl_chain_file` job, on every replica on a timer), `ImportCA`, `ReconcileSuperseded`, the revoke step inside `Clean` and `GenerateWithOptions`, and the retire step inside `Renew`, `AutoRenew` — "retire" because only those two can defer it to the list; `Clean` and `GenerateWithOptions` always revoke inline |
-| `subject:<name>` | The whole lifecycle of one subject: evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
+| `subject:<name>` | The whole lifecycle of one subject: duplicate check or evict/save CSR/sign/delete CSR/renew/import/clean/revoke/generate | `SaveRequest`, `Sign`, `SignWithTTL`, `DeleteRequest`, `Renew`, `AutoRenew`, `Clean`, `ImportCertificate`, `Revoke`, `Generate`/`GenerateWithOptions` |
 | `hmac-key` | Generating and persisting the inventory HMAC key when none is usable — a cold start, or a stored blob of the wrong length | `StorageService.EnsureHMACKey`, reached from `CA.Init` → `InitHMAC` and from `MigrateService` → `RebuildInventoryHMAC`. Deliberately **not** `bootstrap`: the migration already holds that name across the rebuild, and `WithLock` is not reentrant |
 | `sql-schema-migrate` | One schema-migration run, so two replicas starting at once do not migrate concurrently (SQL backends only) | `SQLBackend.EnsureReady` |
 | `inventory-decompose` | One-time legacy inventory blob conversion (etcd and redis backends) on the first start after upgrading | `EtcdBackend.decomposeLegacyInventory` and `RedisBackend.decomposeLegacyInventory`, from `EnsureReady` |
@@ -507,7 +507,7 @@ path — still provides no cross-replica guarantee anyway.
    check that justifies a mutation (duplicate cert? already revoked? CRL still
    fresh?) must run *inside* the same `WithLock` as the mutation, or it is a
    TOCTOU bug. `RefreshCRLIfDue` (check-then-re-sign under one lock) and
-   `SaveRequest` (evict-then-save-then-autosign under one lock) are the
+   `SaveRequest` (check-then-save-then-autosign under one lock) are the
    patterns to copy. [#173](https://github.com/voxpupuli/openvox-ca/issues/173)
    / [PR #186](https://github.com/voxpupuli/openvox-ca/pull/186) exist because
    a renewal once did such a re-check outside the lock.
@@ -1074,7 +1074,7 @@ below, and
 `DeleteRequest`. That last one also pins the far side — it parks a delete on
 the inventory append inside an autosigning `SaveRequest`'s issuance, so it
 observes the lock being held from that append until `SaveRequest` returns, not
-across the evict/save prefix ahead of it. Dropping `SaveRequest`'s `WithLock`
+across the check/save prefix ahead of it. Dropping `SaveRequest`'s `WithLock`
 still fails it, which is what makes `SaveRequest` pinned too.
 
 `Sign` is pinned as well, but in a second shape rather than this one:

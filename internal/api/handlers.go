@@ -701,18 +701,40 @@ func (s *Server) handlePutRequest(w http.ResponseWriter, r *http.Request) {
 
 	signed, err := s.CA.SaveRequest(r.Context(), subject, csrPEM)
 	if err != nil {
-		if errors.Is(err, ca.ErrCertExists) {
-			// A signed certificate already exists for this subject. Return 200 so
-			// the node continues its poll loop and retrieves its cert via GET.
-			// Returning 409 here causes the node (e.g. openvox-agent) to treat the
-			// submission as fatal and abort the run entirely.
-			w.WriteHeader(http.StatusOK)
+		var dup *ca.DuplicateCertError
+		if errors.As(err, &dup) {
+			// The subject already has a pending CSR, a signed certificate or a
+			// revoked one, and allow_duplicate_certs is off. OpenVox Server
+			// answers 400 with this body (handle-put-certificate-request! in
+			// openvox-server's certificate_authority_core.clj, 8.14.1), and the
+			// agent's SSL state machine reads a 400 here as "keep waiting for
+			// the certificate" (NeedSubmitCSR in openvox's
+			// lib/puppet/ssl/state_machine.rb, 9.0.0). Any other non-2xx status
+			// is fatal to the agent's run, so this must stay a 400 — not a 409,
+			// which is why it was once a 200. The body names only the subject
+			// from the path and a fixed state word.
+			//
+			// A waiting agent resubmits its CSR on every poll, so "requested"
+			// is the normal state of a node awaiting manual signing and logs at
+			// INFO. "signed" and "revoked" leave the node stuck until someone
+			// cleans it, which is worth a WARN.
+			if dup.State == ca.DuplicateRequested {
+				slog.Info("SaveRequest refused: duplicate certificate request",
+					"subject", subject, "state", dup.State)
+			} else {
+				slog.Warn("SaveRequest refused: duplicate certificate request",
+					"subject", subject, "state", dup.State,
+					"remedy", "clean the subject (openvox-ca-ctl clean) to let it enrol again")
+			}
+			http.Error(w, dup.Error(), http.StatusBadRequest)
 		} else if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
 			// Policy refusal, not a fault: the CSR is well-formed but asks for
-			// names it may not have. 400 rather than 500 so the agent stops
-			// rather than retrying a request that can never succeed, and the
-			// sentinel's own message rather than err.Error() so the response
-			// stays generic — which entries were refused is in the CA's log.
+			// names it may not have. 400 rather than 500, because a 500 ends the
+			// agent's run as a server fault: the agent reads a 400 as "keep
+			// waiting" (see above), so it waits for an operator rather than
+			// failing. The sentinel's own message rather than err.Error() so
+			// the response stays generic — which entries were refused is in the
+			// CA's log.
 			slog.Warn("SaveRequest refused: disallowed subject alternative names", "subject", subject)
 			http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusBadRequest)
 		} else if csrValidationError(err) {
@@ -1552,12 +1574,15 @@ func (s *Server) handlePostCertificateRenewal(w http.ResponseWriter, r *http.Req
 				return
 			}
 			if errors.Is(err, ca.ErrDisallowedSubjectAltNames) {
-				// 400 as on PUT /certificate_request, and for the same reason:
-				// the client supplied this CSR, the refusal is a policy
-				// decision rather than a fault, and it can never succeed as
-				// submitted — so the agent must stop rather than retry a 500
-				// forever. Without this arm the catch-all below answers 500 and
-				// the agent reads a deliberate refusal as a server problem.
+				// 400, as on PUT /certificate_request: the client supplied this
+				// CSR, and the refusal is a policy decision rather than a fault
+				// that can never succeed as submitted. Without this arm the
+				// catch-all below answers 500, and a deliberate refusal reads as
+				// a server problem in the agent's log and in this CA's metrics.
+				// (The agent's renewal state, NeedRenewedCert, only warns and
+				// carries on with its current certificate whatever the status,
+				// so the code here decides how the refusal reads, not whether
+				// the agent keeps running.)
 				slog.Warn("Renewal refused: disallowed subject alternative names",
 					"subject", sanitiseForLog(cn))
 				http.Error(w, ca.ErrDisallowedSubjectAltNames.Error(), http.StatusBadRequest)
