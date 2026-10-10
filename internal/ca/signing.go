@@ -343,7 +343,7 @@ func (c *CA) Sign(ctx context.Context, subject string) ([]byte, error) {
 	err := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		pem, err := c.signWithDuration(ctx, subject, 0, nil)
+		pem, err := c.signWithDuration(ctx, subject, 0)
 		if err != nil {
 			return err
 		}
@@ -366,7 +366,7 @@ func (c *CA) SignWithTTL(ctx context.Context, subject string, ttl time.Duration)
 	err := c.Storage.WithLock(ctx, subjectLockName(subject), func() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		pem, err := c.signWithDuration(ctx, subject, ttl, nil)
+		pem, err := c.signWithDuration(ctx, subject, ttl)
 		if err != nil {
 			return err
 		}
@@ -379,7 +379,7 @@ func (c *CA) SignWithTTL(ctx context.Context, subject string, ttl time.Duration)
 // sign is the internal (unlocked) signing implementation using the default TTL.
 // c.mu must be held by the caller.
 func (c *CA) sign(ctx context.Context, subject string) ([]byte, error) {
-	return c.signWithDuration(ctx, subject, 0, nil)
+	return c.signWithDuration(ctx, subject, 0)
 }
 
 // asciiLower lowercases A-Z and leaves every other byte alone, which is the
@@ -486,13 +486,9 @@ func truncateSAN(s string) string {
 // submitted CSR. It is the single gate for every path that signs one, which is
 // why it lives on signWithDuration's doorstep rather than at an entry point.
 //
-// baseline, when non-nil, is the certificate this request renews. SANs it
-// already carries were vetted when it was issued, so they are carried forward
-// rather than re-judged: without that, turning the policy on would strand
-// exactly the nodes it was turned on for — a certificate legitimately holding
-// SANs could never be renewed, because its own CSR would be refused. Only
-// entries the presented certificate does not already have face the gate, so a
-// renewal cannot be used to launder a new name past it.
+// Renewal does not reach it. A renewal takes only the public key from its CSR
+// and every name from the certificate it renews (see reissueLeafLocked), so it
+// asks for nothing this gate could judge, whatever the setting says.
 //
 // A DNS entry equal to the subject never counts against a CSR, per RFC 2818
 // §3.1 (upstream's SERVER-2338): an agent that puts its own certname in the SAN
@@ -501,7 +497,7 @@ func truncateSAN(s string) string {
 // its own name beside another is refused for the other one, not for its own.
 // That is distinct from PromoteCNToSAN, which adds that entry when a CSR
 // carries none; this tolerates it when the CSR carries it itself.
-func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, baseline *x509.Certificate) error {
+func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest) error {
 	if c.AllowSubjectAltNames {
 		return nil
 	}
@@ -523,19 +519,9 @@ func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, 
 	// refused rather than quietly trimmed. When #241 lands and all four kinds
 	// are carried through, this comment stops needing the qualification.
 	own := "DNS:" + asciiLower(subject)
-	carried := make(map[string]struct{})
-	if baseline != nil {
-		for _, name := range sanStrings(baseline.DNSNames, baseline.IPAddresses, baseline.EmailAddresses, baseline.URIs) {
-			carried[name] = struct{}{}
-		}
-	}
-
 	disallowed := make([]string, 0, len(requested))
 	for _, name := range requested {
 		if name == own {
-			continue
-		}
-		if _, ok := carried[name]; ok {
 			continue
 		}
 		disallowed = append(disallowed, name)
@@ -558,7 +544,6 @@ func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, 
 		"subject", subject,
 		"disallowed", logged,
 		"disallowed_count", len(disallowed),
-		"renewal", baseline != nil,
 		"setting", "allow_subject_alt_names")
 	return ErrDisallowedSubjectAltNames
 }
@@ -566,7 +551,7 @@ func (c *CA) checkSubjectAltNames(subject string, csr *x509.CertificateRequest, 
 // signWithDuration is the actual internal signing implementation.
 // ttl=0 means use the default certValidity.
 // c.mu must be held by the caller.
-func (c *CA) signWithDuration(ctx context.Context, subject string, ttl time.Duration, baseline *x509.Certificate) ([]byte, error) {
+func (c *CA) signWithDuration(ctx context.Context, subject string, ttl time.Duration) ([]byte, error) {
 	// Fail fast on an uninitialised CA (caller skipped Init(), or it failed)
 	// before we bother reading a CSR from storage, so Sign() returns a clear
 	// ErrNotInitialized rather than a misleading "CSR not found". The actual
@@ -623,7 +608,7 @@ func (c *CA) signWithDuration(ctx context.Context, subject string, ttl time.Dura
 	// the SAN set, so an unconstrained request here is a request to be somebody
 	// else — including this CA's own server name.
 	// NIST 800-53: AC-6 (Least Privilege), IA-5(2) (PKI-Based Authentication)
-	if err := c.checkSubjectAltNames(subject, csr, baseline); err != nil {
+	if err := c.checkSubjectAltNames(subject, csr); err != nil {
 		return nil, err
 	}
 
@@ -687,12 +672,13 @@ func defaultLeafExtKeyUsage() []x509.ExtKeyUsage {
 // index. ttl=0 means use the default certValidity. c.mu must be held by the
 // caller.
 //
-// eku=nil means the serverAuth+clientAuth pair, and two of the four callers now
-// pass something else, so this is no longer what every certificate gets:
+// eku=nil means the serverAuth+clientAuth pair, and two of the four callers
+// arrive at something else, so this is no longer what every certificate gets:
 // issueManagedUnderSubjectLock passes the entry's configured usages, and
-// AutoRenew passes the presented certificate's own usages forward so that a
-// renewal cannot return more authority than it was given. signWithDuration and
-// GenerateWithOptions still pass nil and take the pair.
+// reissueLeafLocked passes nil but carries the renewed certificate's own
+// extended key usage extension in extraExtensions, which displaces the pair —
+// see reissueLeafLocked. signWithDuration and GenerateWithOptions pass nil and
+// take the pair.
 //
 // It is a parameter so that a certificate CAN be narrower: clientAuth is what
 // makes a certificate usable as a CA client, so a deployment that knows its
@@ -704,8 +690,8 @@ func defaultLeafExtKeyUsage() []x509.ExtKeyUsage {
 // append in one place.
 //
 // This is the tail shared by signWithDuration (inputs come from a submitted
-// CSR, after CSR-specific validation), AutoRenew (inputs come from an
-// already-issued certificate's public key, with no CSR involved at all),
+// CSR, after CSR-specific validation), reissueLeafLocked (every input but the
+// public key comes from the certificate being renewed, for both renewal paths),
 // GenerateWithOptions (inputs come from a key this CA just generated, with no
 // client involved at all), and issueManagedUnderSubjectLock (inputs come from server
 // configuration, with no client involved at all).
@@ -895,6 +881,70 @@ func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pk
 		"not_after", template.NotAfter.Format(time.RFC3339),
 	)
 	return certPEM, nil
+}
+
+// renewalRefreshedExtensions are the extensions a renewal does not copy from the
+// certificate it renews, because issueLeafLocked sets each of them afresh.
+//
+// The first two are the ones OpenVox Server refreshes too: its
+// renew-certificate! passes the original extensions through
+// update-extensions-for-new-signing, which replaces exactly the authority and
+// subject key identifiers. The authority key identifier must name the CA
+// certificate signing now, and the subject key identifier must name the key
+// being certified, which on a re-key is not the original's.
+//
+// The other three describe this CA rather than the subject, and issueLeafLocked
+// sets them itself: CRL distribution points from crl_url, authority
+// information access from ocsp_url, and basic constraints, which are a leaf's
+// on every certificate this path issues. OpenVox Server sets neither of the
+// first two on any certificate, so it has nothing to refresh there; carrying
+// them would leave a renewed certificate pointing wherever this CA published
+// when the original was issued.
+var renewalRefreshedExtensions = []asn1.ObjectIdentifier{
+	{2, 5, 29, 35}, // authority key identifier
+	{2, 5, 29, 14}, // subject key identifier
+	{2, 5, 29, 31}, // CRL distribution points
+	OIDAIA,         // authority information access
+	{2, 5, 29, 19}, // basic constraints
+}
+
+// reissueLeafLocked issues the renewal of original for subject, certifying
+// pubKey: the original's own key on auto-renewal, or the CSR's on a re-key.
+// That key is the only thing a renewal takes from anywhere but original. This
+// matches OpenVox Server's renew-certificate!, which "recreates all the
+// extensions in the original certificate".
+//
+// The subject and every extension come from original, verbatim and with their
+// criticality, except renewalRefreshedExtensions. That includes the subject
+// alternative names, the key usage and extended key usage, and every Puppet
+// OID — authorisation-arc ones such as pp_cli_auth included. Nothing in a
+// renewal CSR reaches the certificate except its public key, so a renewal
+// cannot change a certificate's names or authority in either direction.
+//
+// The extensions travel as extraExtensions, which crypto/x509 documents as
+// overriding any extension it would otherwise build from the template's own
+// fields. That is how original's key usage and extended key usage displace
+// issueLeafLocked's defaults. A certificate lacking either one gets the
+// default, which only narrows it: an absent key usage or extended key usage
+// means unrestricted.
+//
+// SECURITY: carrying authorisation OIDs forward is safe only because both
+// callers have established, before reaching here, that this CA issued original
+// (assertOwnCertificate), that it is not revoked (refuseIfRevoked) and that it
+// is subject's. Without the first, any CA trusted for client authentication
+// could have pp_cli_auth reissued under this CA's authority.
+// NIST 800-53: AC-6 (Least Privilege), CM-7 (Least Functionality)
+//
+// c.mu must be held by the caller.
+func (c *CA) reissueLeafLocked(ctx context.Context, subject string, original *x509.Certificate, pubKey any) ([]byte, error) {
+	carried := make([]pkix.Extension, 0, len(original.Extensions))
+	for _, ext := range original.Extensions {
+		if slices.ContainsFunc(renewalRefreshedExtensions, ext.Id.Equal) {
+			continue
+		}
+		carried = append(carried, ext)
+	}
+	return c.issueLeafLocked(ctx, subject, original.Subject, pubKey, subjectAltNames{}, carried, nil, 0)
 }
 
 // Clean revokes (if signed) and removes both the certificate and any pending CSR
@@ -1202,8 +1252,16 @@ func (c *CA) DeleteRequest(ctx context.Context, subject string) error {
 	return nil
 }
 
-// Renew issues a replacement certificate for subject from the provided CSR,
-// bypassing the pending-CSR queue and autosign check. The existing certificate
+// Renew issues a replacement certificate for subject over the public key in the
+// provided CSR, bypassing the pending-CSR queue and autosign check. The key is
+// all it takes from the CSR: the subject, SANs and every other extension come
+// from presentedCert, as they do on AutoRenew and in OpenVox Server's
+// renew-certificate! — see reissueLeafLocked. OpenVox Server has no re-key on
+// renewal at all; this path is openvox-ca's addition, and is kept to exactly
+// that. Its Common Name must still match subject (checked below, and by the
+// handler); anything else it asks for is ignored rather than refused, so a CSR
+// that repeats the certificate's own names and extensions renews like one that
+// carries none. The existing certificate
 // (if any) is replaced atomically under the per-subject distributed lock, and
 // retired once its successor is safely signed and stored: a CSR-based renewal
 // is a genuine re-key, so the old key/cert must not remain a valid credential
@@ -1347,30 +1405,29 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 			return fmt.Errorf("looking up existing certificate for %s: %w", subject, err)
 		}
 
-		// Save the renewal CSR and sign the replacement while holding c.mu,
-		// releasing it via defer before the revoke step below re-acquires it
-		// (c.mu is non-reentrant). The closure keeps the unlock panic-safe: a
-		// panic mid-sign still frees the lock rather than wedging the CA.
+		// Sign the replacement while holding c.mu, releasing it via defer
+		// before the revoke step below re-acquires it (c.mu is non-reentrant).
+		// The closure keeps the unlock panic-safe: a panic mid-sign still frees
+		// the lock rather than wedging the CA.
 		certPEM, err := func() ([]byte, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			if err := c.Storage.SaveCSR(ctx, subject, csrPEM); err != nil {
-				return nil, fmt.Errorf("saving renewal CSR: %w", err)
-			}
-			// The certificate being renewed is the baseline: SANs it already
-			// carries are carried forward, anything new faces the gate.
+			// The certificate being renewed supplies the subject and every
+			// extension; the CSR supplies the key and nothing else. The CSR is
+			// not stored: it is not a request for anything the queue could
+			// later sign, and OpenVox Server's renewal touches no CSR either.
 			//
-			// SECURITY: that is only safe because presentedCert has been
+			// SECURITY: copying presentedCert is only safe because it has been
 			// authenticated by the time it gets here — issued by us, not
 			// revoked, and for this subject. The revocation half of that is
 			// asked twice, and the second ask (above, inside this lock) is what
 			// this depends on: the first answers before the lock is acquired,
 			// so on its own a revocation landing in that window would be
-			// outrun, and a revoked agent's SAN set would become a baseline
-			// that carries its names onto a fresh certificate. Do not collapse
-			// the two checks into one on the grounds that they look redundant.
+			// outrun, and a revoked agent's names and authority would be
+			// carried onto a fresh certificate. Do not collapse the two checks
+			// into one on the grounds that they look redundant.
 			// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
-			return c.signWithDuration(ctx, subject, 0, presentedCert)
+			return c.reissueLeafLocked(ctx, subject, presentedCert, csr.PublicKey)
 		}()
 		if err != nil {
 			return err
@@ -1409,11 +1466,12 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 // CSR" renewal flow real Puppet/OpenVox agents use by default (see
 // Puppet's `hostcert_renewal_interval`, default 30 days): the mTLS handshake
 // already proved possession of the private key, so a second
-// proof-of-possession isn't required. presentedCert's SANs and Puppet OID
-// extensions — including any auth OIDs such as pp_cli_auth — are carried
-// forward verbatim, since they were already vetted when presentedCert itself
-// was issued; only the serial, validity window, and key identifiers are
-// refreshed.
+// proof-of-possession isn't required. presentedCert's subject and extensions —
+// SANs, key usages, and Puppet OIDs including auth OIDs such as pp_cli_auth —
+// are carried forward verbatim, since they were already vetted when
+// presentedCert itself was issued. That is OpenVox Server's renew-certificate!
+// exactly, apart from the CA-describing extensions reissueLeafLocked refreshes
+// from this CA's configuration.
 //
 // That vetting argument holds only because assertOwnCertificate has
 // already established that this CA issued presentedCert. The two are a pair:
@@ -1495,24 +1553,6 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 	ctx, cancel := context.WithTimeout(ctx, LockTimeout)
 	defer cancel()
 
-	var extraExtensions []pkix.Extension
-	for _, ext := range presentedCert.Extensions {
-		// Carry EVERY Puppet OID forward, including authorization-arc OIDs
-		// (pp_cli_auth et al.). Unlike signWithDuration's CSR path — which adds
-		// `&& !IsAuthOID(ext.Id)` here to strip auth OIDs as an anti-escalation
-		// control — these were already vetted when presentedCert was issued, so
-		// preserving them is required for wire-compat (e.g. OpenVox Server's own
-		// cert keeps pp_cli_auth across renewal, or the CA CLI stops
-		// authenticating). Do NOT add an IsAuthOID filter here; see this
-		// method's godoc.
-		//
-		// This is safe only because assertOwnCertificate above established
-		// that we issued presentedCert. Do not remove that check while leaving
-		// this carry-forward in place. NIST 800-53: AC-6, CM-7.
-		if IsPuppetOID(ext.Id) {
-			extraExtensions = append(extraExtensions, ext)
-		}
-	}
 	oldSerial := serialHexStr(presentedCert.SerialNumber)
 
 	var out []byte
@@ -1533,43 +1573,11 @@ func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]
 		certPEM, err := func() ([]byte, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			// Carry forward every SAN type from the certificate being renewed,
-			// not just DNS names: a leaf imported from a legacy CA may carry IP,
-			// email, or URI SANs that services still depend on, and auto-renewal
-			// must not silently drop them.
-			sans := subjectAltNames{
-				DNSNames:       presentedCert.DNSNames,
-				IPAddresses:    presentedCert.IPAddresses,
-				EmailAddresses: presentedCert.EmailAddresses,
-				URIs:           presentedCert.URIs,
-			}
-			// SECURITY: carry the extended key usages forward for the same
-			// reason as the SANs, with a sharper consequence. Renewal must not
-			// hand back more authority than it was given: passing nil here
-			// means issueLeafLocked applies its serverAuth+clientAuth default,
-			// so a deliberately narrow certificate comes back wide, for the
-			// same public key and the same subject, with nothing in the
-			// exchange recording that it widened.
-			//
-			// A serverAuth-only certificate cannot reach this path today —
-			// attribute() verifies every client certificate against
-			// ExtKeyUsageClientAuth, so one lacking it is never attributed to a
-			// trust domain and never passes the tierOwnClient gate guarding
-			// this route. A clientAuth-only certificate reaches it perfectly
-			// well, and that is the one that gains serverAuth it was never
-			// issued with. The narrowing is worth keeping either way: it costs
-			// nothing, and it stops the gate being the only thing standing
-			// between a narrow certificate and a wide renewal of it.
-			//
-			// Empty means unrestricted, so it stays empty and takes the
-			// default: a certificate carrying no EKU at all is every agent
-			// issued before this CA set one, and narrowing those on renewal
-			// would break them.
-			var eku []x509.ExtKeyUsage
-			if len(presentedCert.ExtKeyUsage) > 0 {
-				eku = presentedCert.ExtKeyUsage
-			}
-			return c.issueLeafLocked(ctx, subject, presentedCert.Subject, presentedCert.PublicKey, sans, extraExtensions, eku, 0)
+			// Same key, and everything else from presentedCert too: every SAN
+			// type, the key usages and every Puppet OID, authorisation-arc ones
+			// included. See reissueLeafLocked, and this method's godoc for why
+			// the authorisation OIDs are safe to carry.
+			return c.reissueLeafLocked(ctx, subject, presentedCert, presentedCert.PublicKey)
 		}()
 		if err != nil {
 			return err

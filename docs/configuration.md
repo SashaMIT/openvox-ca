@@ -1371,12 +1371,11 @@ Server's `allow-subject-alt-names`.
 > **What you will see if your agents request alt names.** Any node whose CSR
 > asks for a name beyond its own certname — a `dns_alt_names` setting in its
 > `puppet.conf`, or a service enrolling under several hostnames — cannot enrol
-> or re-key while this is off. The CA logs a `WARN` naming
-> `allow_subject_alt_names`, and the client gets a `400` (autosigned) or a `409`
-> (manual signing). Set `allow_subject_alt_names: true` if that is what your
-> fleet needs. Certificates that already hold SANs keep renewing either way:
-> renewal carries their existing names forward, so only new registrations and
-> re-keys are affected.
+> while this is off. The CA logs a `WARN` naming `allow_subject_alt_names`, and
+> the client gets a `400` (autosigned) or a `409` (manual signing). Set
+> `allow_subject_alt_names: true` if that is what your fleet needs. Renewal is
+> unaffected either way: a renewal, re-key included, keeps the names of the
+> certificate it renews, so only new registrations are.
 
 It matters most with autosigning. TLS peers match the name they dialled against
 a certificate's SAN set, not its Common Name, so a CSR that may name anything is
@@ -1414,17 +1413,19 @@ are in the CA's log, at `WARN`:
 ```text
 level=WARN msg="Refusing CSR: requested subject alternative names are not allowed"
   subject=web01 disallowed="[DNS:puppet.example.com]" disallowed_count=1
-  renewal=false setting=allow_subject_alt_names
+  setting=allow_subject_alt_names
 ```
 
 The gate covers names carried on a *submitted CSR*. Three paths are treated
 differently, all deliberately:
 
-- **Renewal** is judged against the certificate being renewed rather than against
-  policy, so a certificate that already carries SANs stays renewable after the
-  setting is turned off — otherwise enabling the gate would strand exactly the
-  nodes it was enabled for. The gate does still run: a renewal may keep the names
-  its own certificate already has, and may not introduce new ones.
+- **Renewal** takes its names from the certificate being renewed, as OpenVox
+  Server's renewal does, and none from a request — a re-key CSR contributes only
+  its public key (see [certificate renewal](api.md#certificate-renewal)). So the
+  gate has nothing to judge, and the setting does not apply in either direction:
+  a certificate that already carries SANs stays renewable after it is turned
+  off, and a re-key asking for a new name gets the certificate's own names back
+  rather than a refusal, even with it on.
 - **`openvox-ca generate --dns`** mints offline from names an operator typed on
   the CA host, and is not filtered.
 - **`POST /generate/{subject}?dns=`** is the same minting path reached over HTTP,

@@ -59,7 +59,7 @@ var _ = Describe("The issuance seam", func() {
 	expected := map[string]string{
 		"signWithDuration":             "the gated path: calls checkSubjectAltNames before it issues anything",
 		"GenerateWithOptions":          "offline and admin-only minting; names come from an operator's flags or an admin-tier query parameter, never from an agent's CSR",
-		"AutoRenew":                    "carries the presented certificate's own SANs forward and reads none from a request, so there is nothing for the gate to judge",
+		"reissueLeafLocked":            "both renewal paths; takes the subject and every SAN from the certificate being renewed and only the public key from a CSR, so there is nothing for the gate to judge",
 		"issueManagedUnderSubjectLock": "managed certificates take their names from server configuration, fixed before the process serves anything; no request reaches this path, so there is nothing for the gate to judge",
 	}
 
