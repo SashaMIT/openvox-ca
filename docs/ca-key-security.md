@@ -65,6 +65,32 @@ The same isolation is why the shipped systemd unit sets `LimitCORE=0` and
 withholds `$NOTIFY_SOCKET` from the signer — see
 [running under systemd](systemd.md).
 
+### What the split does not cover
+
+The split keeps the key out of the frontend's address space, so a bug that
+discloses the frontend's memory cannot leak it. It does not stand between the
+key and code running in the frontend. Both children run as the same user, and
+the frontend opens the same store as the signer, with the same credentials, to
+serve requests. The stored key (`private/ca_key.pem` on the filesystem backend,
+the `ca_key` blob on the others) is readable to it, and so is anything else that
+user can read: a passphrase file, the auto-generated passphrase, and the
+signer's environment.
+
+Two things change that:
+
+1. **OpenBao Transit custody (recommended).** The key is created inside OpenBao
+   and never leaves it, so there is nothing in the store or on the host to copy.
+   Code running as the service user can still reach the signer's OpenBao
+   credentials and sign with the key until they are revoked, but it cannot take
+   the key away. See [OpenBao Transit-engine key
+   custody](#openbao-transit-engine-key-custody).
+2. **[Encryption at rest](#ca-key-encryption-at-rest).** The stored key is
+   unusable without the passphrase wherever it travels on its own: backups,
+   database dumps, replicas, another user of a shared database. It does not
+   protect the key from the service user, which can read the passphrase
+   wherever the signer reads it from; see
+   [security considerations](#security-considerations).
+
 ### The signer is a shared resource, and how it is bounded
 
 Every signature the CA makes crosses the socketpair to this one process:
