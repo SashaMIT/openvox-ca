@@ -98,12 +98,19 @@ var _ = Describe("PostgreSQL sql_tls_* configuration", func() {
 		Entry("an IPv6 address with no port", "postgres://u:p@[2001:db8::10]/ca", "cannot find the PostgreSQL host"),
 	)
 
-	It("refuses at open time, before any connection is attempted", func() {
-		_, err := NewSQLBackend(SQLConfig{
-			Dialect: SQLPostgres,
-			DSN:     "postgres://u:p@/ca?host=/var/run/postgresql",
-			TLS:     base,
-		})
-		Expect(err).To(MatchError(ContainSubstring("unix socket")))
-	})
+	// The refusal belongs to the sql_tls_* files alone: without them the same
+	// DSNs open exactly as before. NewSQLBackend connects lazily, so neither
+	// half dials anything.
+	DescribeTable("refuses at open time only when sql_tls_* is set",
+		func(dsn, reason string) {
+			_, err := NewSQLBackend(SQLConfig{Dialect: SQLPostgres, DSN: dsn, TLS: base})
+			Expect(err).To(MatchError(ContainSubstring(reason)))
+
+			b, err := NewSQLBackend(SQLConfig{Dialect: SQLPostgres, DSN: dsn})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(b.Close()).To(Succeed())
+		},
+		Entry("a Unix socket", "postgres://u:p@/ca?host=/var/run/postgresql", "unix socket"),
+		Entry("several hosts", "postgres://u:p@db1.example.com:5432,db2.example.com:5432/ca", "names several"),
+	)
 })
