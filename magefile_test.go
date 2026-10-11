@@ -1437,19 +1437,45 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 			},
 			Entry("the action itself", "actions/cache"),
 			Entry("its restore sub-action", "actions/cache/restore"),
+			Entry("its save sub-action", "actions/cache/save"),
 		)
 
 		DescribeTable("rejects a BuildKit cache on docker/build-push-action",
-			func(key string) {
+			func(key, input string) {
 				Expect(verifyTagWorkflowsColdIn(map[string][]byte{
 					"release.yml": workflow(tagOn, coldGo+
 						"      - uses: docker/build-push-action@abc\n        with:\n          "+
 						key+": type=gha\n"),
 				})).To(MatchError(ContainSubstring(
-					`release.yml job "build" step 2 (docker/build-push-action) sets ` + key)))
+					`release.yml job "build" step 2 (docker/build-push-action) sets ` + input)))
 			},
-			Entry("cache-from", "cache-from"),
-			Entry("cache-to", "cache-to"),
+			Entry("cache-from", "cache-from", "cache-from"),
+			Entry("cache-to", "cache-to", "cache-to"),
+			// The runner upper-cases input names into INPUT_* variables, so
+			// this spelling configures the cache exactly as cache-from does.
+			Entry("Cache-From, which the runner reads as cache-from", "Cache-From", "cache-from"),
+		)
+
+		It("accepts setup-go's cache input spelled in another case", func() {
+			Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+				"release.yml": workflow(tagOn,
+					"      - uses: actions/setup-go@abc\n        with:\n          Cache: false\n"),
+			})).To(Succeed())
+		})
+
+		// Two spellings of one input are one input to the runner, so a cold
+		// spelling beside a warm one must not read as cold.
+		DescribeTable("rejects an input set twice under different cases",
+			func(action, with, input string) {
+				Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+					"release.yml": workflow(tagOn, coldGo+"      - uses: "+action+"@abc\n        with:\n"+with),
+				})).To(MatchError(ContainSubstring(
+					"step 2 (" + action + ") sets the " + input + " input more than once under different cases")))
+			},
+			Entry("on setup-go", "actions/setup-go",
+				"          cache: false\n          Cache: true\n", "cache"),
+			Entry("on docker/build-push-action", "docker/build-push-action",
+				"          push: true\n          PUSH: false\n", "push"),
 		)
 
 		It("accepts docker/build-push-action with no cache inputs", func() {
@@ -1459,13 +1485,37 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 			})).To(Succeed())
 		})
 
-		It("reports every violation, not only the first", func() {
+		It("reports every violation across workflows, not only the first", func() {
 			err := verifyTagWorkflowsColdIn(map[string][]byte{
 				"helm-chart.yml": workflow(tagOn, warmGo),
 				"release.yml":    workflow(tagOn, "      - uses: actions/setup-go@abc\n"),
 			})
 			Expect(err).To(MatchError(ContainSubstring("helm-chart.yml job")))
 			Expect(err).To(MatchError(ContainSubstring("release.yml job")))
+		})
+
+		// Within one workflow: the violations sit in the job that sorts last,
+		// behind a clean one, so a check that stopped at the first job or the
+		// first violation would miss them. Both real tag workflows keep their
+		// setup-go step in the job that sorts first, so nothing else pins this.
+		It("reports every violation in every job of one workflow", func() {
+			err := verifyTagWorkflowsColdIn(map[string][]byte{
+				"release.yml": []byte("on:\n" + tagOn + "jobs:\n" +
+					"  aaa:\n    steps:\n" + coldGo +
+					"  zzz:\n    steps:\n" +
+					"      - uses: actions/setup-go@abc\n" +
+					"      - uses: actions/cache@abc\n" +
+					"      - uses: docker/build-push-action@abc\n        with:\n" +
+					"          cache-from: type=gha\n          cache-to: type=gha\n"),
+			})
+			for _, want := range []string{
+				`job "zzz" step 1 (actions/setup-go) has no ` + "`cache:` input",
+				`job "zzz" step 2 (actions/cache) restores or saves a cache`,
+				`job "zzz" step 3 (docker/build-push-action) sets cache-from`,
+				`job "zzz" step 3 (docker/build-push-action) sets cache-to`,
+			} {
+				Expect(err).To(MatchError(ContainSubstring(want)))
+			}
 		})
 
 		// Asserted on the parse failure itself: a file that failed to parse
@@ -1517,6 +1567,9 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 			Entry("a list including push", "on: [pull_request, push]\n", true),
 			Entry("a list without push", "on: [pull_request]\n", false),
 			Entry("a mapping without push", "on:\n  pull_request:\n", false),
+			// Every real workflow lists push first; this ordering is the one
+			// that pins skipping past the keys that are not push.
+			Entry("push after another trigger", "on:\n  workflow_dispatch:\n"+tagOn, true),
 			Entry("push with no value", "on:\n  push:\n", true),
 			Entry("push filtered only by paths", "on:\n  push:\n    paths: [\"charts/**\"]\n", true),
 			Entry("push filtered by tags", "on:\n"+tagOn, true),

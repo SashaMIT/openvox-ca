@@ -1221,6 +1221,9 @@ func verifyTagWorkflowsColdIn(sources map[string][]byte) error {
 //  2. no actions/cache step, including its restore and save sub-actions;
 //  3. no `cache-from` or `cache-to` on docker/build-push-action.
 //
+// Input names are matched case-insensitively, as the runner reads them (see
+// foldInputs), so `Cache-From:` is caught as surely as `cache-from:`.
+//
 // Scope, stated because it is narrower than "nothing a tag build runs restores
 // a cache": the rules read only the steps written in the workflow file, and
 // never follow a reference. A local composite action (`uses: ./...`) or a
@@ -1241,10 +1244,19 @@ func verifyColdTagStepsIn(name string, doc tagCacheWorkflowDoc) (int, error) {
 		for i, s := range doc.Jobs[job].Steps {
 			uses, _, _ := strings.Cut(s.Uses, "@")
 			where := fmt.Sprintf("%s job %q step %d (%s)", name, job, i+1, uses)
+			inputs, clash := foldInputs(s.With)
+			clashErr := func() {
+				if clash != "" {
+					errs = append(errs, fmt.Errorf("%s sets the %s input more than once under different "+
+						"cases, and the runner reads them as one input, so this check cannot tell which "+
+						"value the action sees; keep one, in lower case", where, clash))
+				}
+			}
 			switch action := actionPath(s.Uses); {
 			case action == "actions/setup-go":
 				setupGoSteps++
-				cache, ok := s.With["cache"]
+				clashErr()
+				cache, ok := inputs["cache"]
 				if !ok {
 					errs = append(errs, fmt.Errorf("%s has no `cache:` input, and setup-go defaults it "+
 						"to true, so a tag build would restore a Go build cache that main can write; "+
@@ -1258,8 +1270,9 @@ func verifyColdTagStepsIn(name string, doc tagCacheWorkflowDoc) (int, error) {
 				errs = append(errs, fmt.Errorf("%s restores or saves a cache in a workflow that runs "+
 					"on a tag; a tag build must not link anything a job on main wrote", where))
 			case action == "docker/build-push-action":
+				clashErr()
 				for _, key := range []string{"cache-from", "cache-to"} {
-					if _, ok := s.With[key]; ok {
+					if _, ok := inputs[key]; ok {
 						errs = append(errs, fmt.Errorf("%s sets %s in a workflow that runs on a tag; "+
 							"a tag build's image must not share a BuildKit cache with main's", where, key))
 					}
@@ -1276,6 +1289,26 @@ func verifyColdTagStepsIn(name string, doc tagCacheWorkflowDoc) (int, error) {
 func actionPath(uses string) string {
 	path, _, _ := strings.Cut(uses, "@")
 	return strings.ToLower(path)
+}
+
+// foldInputs returns a step's `with:` keyed by lowercased input name, and the
+// first name (in sorted order) that appears more than once once case is
+// ignored, or "" if none does. The runner hands an action its inputs as
+// INPUT_<NAME> environment variables, upper-cased, so `Cache-From:` reaches
+// docker/build-push-action exactly as `cache-from:` would; and two spellings
+// of one name are one input, so `cache: false` beside `Cache: true` cannot be
+// read as cold.
+func foldInputs(with map[string]yaml.Node) (map[string]yaml.Node, string) {
+	folded := make(map[string]yaml.Node, len(with))
+	clash := ""
+	for _, key := range slices.Sorted(maps.Keys(with)) {
+		lower := strings.ToLower(key)
+		if _, dup := folded[lower]; dup && clash == "" {
+			clash = lower
+		}
+		folded[lower] = with[key]
+	}
+	return folded, clash
 }
 
 // pushCanFireOnTag reports whether a workflow's `on:` includes a push trigger
