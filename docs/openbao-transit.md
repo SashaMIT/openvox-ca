@@ -172,6 +172,10 @@ prefix instead, since there's no flat-file nesting for those).
 | `openbao.tls_key_file` | `PUPPET_CA_OPENBAO_TLS_KEY_FILE` | `--openbao-tls-key-file` | Client private key PEM for mTLS to OpenBao |
 | `openbao.auth_method` | `PUPPET_CA_OPENBAO_AUTH_METHOD` | `--openbao-auth-method` | `approle`, `token`, or `kubernetes` |
 
+The OpenBao client library also reads its own `BAO_*` and `VAULT_*`
+environment variables, and several of them override the settings above. See
+[OpenBao client environment variables](#openbao-client-environment-variables).
+
 ### AppRole auth (VM / systemd deployments)
 
 > Running as a systemd service? See [running under systemd](systemd.md) for the shipped unit; the `role_id` and `secret_id` files below are re-read on every login, so rotating them needs neither a reload nor a restart.
@@ -233,6 +237,44 @@ No Vault/OpenBao Agent sidecar, injector, or init container is required — the
 pod only needs its own ServiceAccount bound to an OpenBao Kubernetes auth
 role; `openvox-ca` logs in and maintains its own token for as long as the
 process runs.
+
+### OpenBao client environment variables
+
+The OpenBao client that `openvox-ca` uses reads the standard OpenBao
+environment variables, the same ones the `bao` CLI reads, in whichever process
+holds the OpenBao client (see [process isolation](#process-isolation)). Each
+`BAO_*` variable falls back to its `VAULT_*` spelling when the `BAO_*` one is
+absent: `VAULT_SKIP_VERIFY` acts exactly like `BAO_SKIP_VERIFY`. A `BAO_*`
+variable that is present but empty still takes precedence, so it hides the
+`VAULT_*` one, and an empty value has no effect.
+
+`openvox-ca` deliberately keeps honouring them, so an administrator can still
+use them, but some override the `openbao` settings above. The table lists
+every variable the client reads and which side wins.
+
+| Variable | What it controls | Which wins |
+| --- | --- | --- |
+| `BAO_ADDR` | OpenBao server address | `openvox-ca`: `openbao.addr` is required and always replaces it |
+| `BAO_AGENT_ADDR` | Address of a local OpenBao Agent; the client sends every request there | **Environment**: replaces `openbao.addr` |
+| `BAO_CLIENT_TIMEOUT` | Per-request timeout | `openvox-ca`: the signer always sets its own 10-second timeout |
+| `BAO_CACERT`, `BAO_CACERT_BYTES`, `BAO_CAPATH` | CA certificates added to the system trust store to verify the OpenBao server | Environment, unless `openbao.tls_ca_file` is set. The trust store is then rebuilt from the system store and that file, and these are discarded |
+| `BAO_CLIENT_CERT`, `BAO_CLIENT_KEY`, `BAO_CLIENT_CERT_BYTES`, `BAO_CLIENT_KEY_BYTES` | Client certificate presented to OpenBao | Environment, unless `openbao.tls_cert_file` and `openbao.tls_key_file` are set. `openbao.tls_ca_file` on its own leaves the environment's client certificate in place |
+| `BAO_SKIP_VERIFY` | Turns off verification of the OpenBao server's certificate | **Environment, always.** No `openvox-ca` setting turns verification back on, so this wins even when `openbao.tls_ca_file` is set |
+| `BAO_TLS_SERVER_NAME` | Server name sent in TLS SNI and checked against the OpenBao certificate | Environment; no `openvox-ca` setting |
+| `BAO_HTTP_PROXY`, `BAO_PROXY_ADDR` | Proxy every request goes through; `BAO_PROXY_ADDR` takes precedence if both are set | Environment; no `openvox-ca` setting |
+| `BAO_MAX_RETRIES` | Retries after a 5xx response (default 2) | Environment; no `openvox-ca` setting |
+| `BAO_RATE_LIMIT` | Client-side request rate limit | Environment; no `openvox-ca` setting |
+| `BAO_SRV_LOOKUP` | Resolves the server through DNS SRV records when `openbao.addr` has no port | Environment; no `openvox-ca` setting |
+| `BAO_DISABLE_REDIRECTS` | Stops the client following a redirect from OpenBao | Environment; no `openvox-ca` setting |
+| `BAO_NAMESPACE` | Namespace sent with every request, so the auth mount, the Transit mount and the key are all looked up inside it | Environment; no `openvox-ca` setting |
+| `BAO_TOKEN` | The client's initial token | AppRole and Kubernetes auth: the environment, until the first login. The token is sent as the `X-Vault-Token` header of that login request, then replaced by the token the login returns. Token auth: `openvox-ca`, because `openbao.token_file` is loaded before the first request, so this is never sent |
+| `BAO_WRAP_TTL` | Asks OpenBao to response-wrap every response; read on every request | Environment. The signer does not unwrap responses, so expect login or signing to fail while it is set |
+
+The client library also declares `BAO_MFA` and `BAO_TOKEN_PATH`, but the
+client `openvox-ca` builds does not read them. Below the client library, Go's
+standard `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply when no
+`BAO_*` proxy is set, and `SSL_CERT_FILE` and `SSL_CERT_DIR` change the system
+trust store.
 
 ## Running under an external root CA
 
