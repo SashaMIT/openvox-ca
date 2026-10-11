@@ -18,8 +18,10 @@
 package openbao
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 
@@ -36,11 +38,14 @@ import (
 // but some of them override cfg, so logEnvironment reports every one in
 // effect once the client is built. When the environment stops the client
 // being built at all, the error names the variables that were set instead,
-// since the SDK's own message does not always say where its input came from.
+// since the SDK's own message does not always say where its input came from,
+// and withholds any URL the environment supplied (see withholdURL).
 func newClient(cfg Config) (*api.Client, error) {
 	openBaoCfg := api.DefaultConfig()
 	if openBaoCfg.Error != nil {
-		return nil, fmt.Errorf("building default OpenBao client config%s: %w", envVariablesSetSuffix(), openBaoCfg.Error)
+		// The only URL ReadEnvironment parses is the proxy's.
+		return nil, fmt.Errorf("building default OpenBao client config%s: %w",
+			envVariablesSetSuffix(), withholdURL(openBaoCfg.Error, true))
 	}
 	openBaoCfg.Address = cfg.Addr
 	openBaoCfg.Timeout = cfg.loginTimeout()
@@ -58,7 +63,10 @@ func newClient(cfg Config) (*api.Client, error) {
 
 	client, err := api.NewClient(openBaoCfg)
 	if err != nil {
-		return nil, fmt.Errorf("creating OpenBao client%s: %w", envVariablesSetSuffix(), err)
+		// NewClient parses BAO_AGENT_ADDR when it is set, openbao.addr when not.
+		fromEnv := openBaoCfg.AgentAddress != ""
+		return nil, fmt.Errorf("creating OpenBao client%s: %w",
+			envVariablesSetSuffix(), withholdURL(err, fromEnv))
 	}
 	logEnvironment(cfg, openBaoCfg)
 	return client, nil
@@ -273,6 +281,20 @@ func envVariablesSetSuffix() string {
 		return ""
 	}
 	return " (OpenBao environment variables set: " + strings.Join(set, ", ") + ")"
+}
+
+// withholdURL replaces a URL parse error with one that carries none of the
+// URL when fromEnv says the environment supplied it. *url.Error quotes the
+// whole URL, and the reason it wraps can quote part of it too (an invalid
+// port, an invalid escape), so a proxy or agent address with a credential in
+// it would otherwise reach the log. A URL from openvox-ca's own
+// configuration keeps the detail.
+func withholdURL(err error, fromEnv bool) error {
+	var urlErr *url.Error
+	if !fromEnv || !errors.As(err, &urlErr) {
+		return err
+	}
+	return fmt.Errorf("%s of a URL from the environment failed (value withheld)", urlErr.Op)
 }
 
 // envSpelling returns the spelling of name the SDK actually read: the BAO_

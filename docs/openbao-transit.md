@@ -297,7 +297,9 @@ A clean environment logs none of these. The lines appear once each time the
 process holding the OpenBao client starts, and are not repeated when it logs
 in to OpenBao again. If a variable stops the client being built at all, such
 as a `BAO_CLIENT_CERT` without `BAO_CLIENT_KEY`, the startup error lists the
-variables that were set, again by name only.
+variables that were set, again by name only. When the failure is a proxy or
+agent address from the environment that does not parse as a URL, the error
+withholds the address, since it may carry a password.
 
 ## Running under an external root CA
 

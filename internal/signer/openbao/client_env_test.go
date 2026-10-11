@@ -108,6 +108,9 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 			regexp.QuoteMeta(variable) + ` effect="[^"]+"`
 	}
 	infoLine := func(variable, setting string) string {
+		if strings.Contains(setting, " ") {
+			setting = strconv.Quote(setting) // as slog's TextHandler writes it
+		}
 		return `level=INFO msg="OpenBao environment variable has no effect" variable=` +
 			regexp.QuoteMeta(variable) + ` superseded_by=` + regexp.QuoteMeta(setting) + `\n`
 	}
@@ -251,65 +254,128 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 	// The supersession is a prediction made from cfg alone, so each case
 	// also checks the trust pool of the client that was actually built: if
 	// the SDK ever merged the pools instead of rebuilding them, the log line
-	// would be wrong and these specs would say so.
+	// would be wrong and these specs would say so. Each of the three ways
+	// the environment can supply a CA gets both cases, so a row wired to the
+	// wrong predicate fails too.
 	Context("with a CA from the environment", func() {
 		var envCA *x509.Certificate
 
-		BeforeEach(func() {
-			var path string
-			path, envCA = writeCA()
-			GinkgoT().Setenv("BAO_CACERT", path)
-		})
+		// setCA supplies a fresh CA through variable, in the form it takes.
+		setCA := func(variable string) {
+			path, cert := writeCA()
+			envCA = cert
+			switch variable {
+			case "BAO_CACERT":
+				GinkgoT().Setenv(variable, path)
+			case "BAO_CACERT_BYTES":
+				GinkgoT().Setenv(variable, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})))
+			case "BAO_CAPATH":
+				GinkgoT().Setenv(variable, filepath.Dir(path))
+			default:
+				Fail("no CA form for " + variable)
+			}
+		}
 
 		trusts := func(client *api.Client) bool {
 			_, err := envCA.Verify(x509.VerifyOptions{Roots: client.CloneConfig().TLSConfig().RootCAs})
 			return err == nil
 		}
 
-		It("warns, and trusts that CA, when openbao.tls_ca_file is unset", func() {
-			client := build()
-			Expect(buf.String()).To(MatchRegexp(warnLine("BAO_CACERT")))
-			Expect(trusts(client)).To(BeTrue())
-		})
+		DescribeTable("warns, and trusts that CA, when openbao.tls_ca_file is unset",
+			func(variable string) {
+				setCA(variable)
+				client := build()
+				Expect(buf.String()).To(MatchRegexp(warnLine(variable)))
+				Expect(trusts(client)).To(BeTrue())
+			},
+			Entry(nil, "BAO_CACERT"),
+			Entry(nil, "BAO_CACERT_BYTES"),
+			Entry(nil, "BAO_CAPATH"),
+		)
 
-		It("reports it as superseded, and no longer trusts it, when openbao.tls_ca_file is set", func() {
-			cfg.TLSCAFile, _ = writeCA()
-			client := build()
-			Expect(buf.String()).To(MatchRegexp(infoLine("BAO_CACERT", "openbao.tls_ca_file")))
-			Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
-			Expect(trusts(client)).To(BeFalse())
-		})
+		DescribeTable("reports it as superseded, and no longer trusts it, when openbao.tls_ca_file is set",
+			func(variable string) {
+				setCA(variable)
+				cfg.TLSCAFile, _ = writeCA()
+				client := build()
+				Expect(buf.String()).To(MatchRegexp(infoLine(variable, "openbao.tls_ca_file")))
+				Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
+				Expect(trusts(client)).To(BeFalse())
+			},
+			Entry(nil, "BAO_CACERT"),
+			Entry(nil, "BAO_CACERT_BYTES"),
+			Entry(nil, "BAO_CAPATH"),
+		)
 	})
 
+	// The environment can supply a client certificate as files or as PEM
+	// bytes; both forms get every case.
 	Context("with a client certificate from the environment", func() {
-		BeforeEach(func() {
-			certPath, keyPath := writeKeyPair()
-			GinkgoT().Setenv("BAO_CLIENT_CERT", certPath)
-			GinkgoT().Setenv("BAO_CLIENT_KEY", keyPath)
-		})
+		var certVar, keyVar string
 
-		It("warns when openvox-ca configures no TLS files", func() {
-			build()
-			Expect(buf.String()).To(MatchRegexp(warnLine("BAO_CLIENT_CERT")))
-			Expect(buf.String()).To(MatchRegexp(warnLine("BAO_CLIENT_KEY")))
-		})
+		setClientCert := func(bytesForm bool) {
+			certPath, keyPath := writeKeyPair()
+			certVar, keyVar = "BAO_CLIENT_CERT", "BAO_CLIENT_KEY"
+			certValue, keyValue := certPath, keyPath
+			if bytesForm {
+				certVar, keyVar = "BAO_CLIENT_CERT_BYTES", "BAO_CLIENT_KEY_BYTES"
+				certPEM, err := os.ReadFile(certPath)
+				Expect(err).NotTo(HaveOccurred())
+				keyPEM, err := os.ReadFile(keyPath)
+				Expect(err).NotTo(HaveOccurred())
+				certValue, keyValue = string(certPEM), string(keyPEM)
+			}
+			GinkgoT().Setenv(certVar, certValue)
+			GinkgoT().Setenv(keyVar, keyValue)
+		}
+
+		DescribeTable("warns when openvox-ca configures no TLS files",
+			func(bytesForm bool) {
+				setClientCert(bytesForm)
+				build()
+				Expect(buf.String()).To(MatchRegexp(warnLine(certVar)))
+				Expect(buf.String()).To(MatchRegexp(warnLine(keyVar)))
+			},
+			Entry("as files", false),
+			Entry("as PEM bytes", true),
+		)
 
 		// ConfigureTLS replaces the client certificate only when it is given
 		// one, so a CA file alone leaves the environment's certificate in use.
-		It("still warns when only openbao.tls_ca_file is set", func() {
-			cfg.TLSCAFile, _ = writeCA()
-			build()
-			Expect(buf.String()).To(MatchRegexp(warnLine("BAO_CLIENT_CERT")))
-			Expect(buf.String()).To(MatchRegexp(warnLine("BAO_CLIENT_KEY")))
-		})
+		DescribeTable("still warns when only openbao.tls_ca_file is set",
+			func(bytesForm bool) {
+				setClientCert(bytesForm)
+				cfg.TLSCAFile, _ = writeCA()
+				build()
+				Expect(buf.String()).To(MatchRegexp(warnLine(certVar)))
+				Expect(buf.String()).To(MatchRegexp(warnLine(keyVar)))
+			},
+			Entry("as files", false),
+			Entry("as PEM bytes", true),
+		)
 
-		It("reports it as superseded when openbao.tls_cert_file and tls_key_file are set", func() {
-			cfg.TLSCertFile, cfg.TLSKeyFile = writeKeyPair()
-			build()
-			Expect(buf.String()).To(MatchRegexp(infoLine("BAO_CLIENT_CERT", "openbao.tls_cert_file")))
-			Expect(buf.String()).To(MatchRegexp(infoLine("BAO_CLIENT_KEY", "openbao.tls_cert_file")))
-			Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
-		})
+		DescribeTable("reports it as superseded when openbao.tls_cert_file and tls_key_file are set",
+			func(bytesForm bool) {
+				setClientCert(bytesForm)
+				cfg.TLSCertFile, cfg.TLSKeyFile = writeKeyPair()
+				build()
+				Expect(buf.String()).To(MatchRegexp(infoLine(certVar, "openbao.tls_cert_file")))
+				Expect(buf.String()).To(MatchRegexp(infoLine(keyVar, "openbao.tls_cert_file")))
+				Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
+			},
+			Entry("as files", false),
+			Entry("as PEM bytes", true),
+		)
+	})
+
+	// newClient sets the request timeout after the SDK has read the
+	// environment, so BAO_CLIENT_TIMEOUT never reaches the built client.
+	It("reports BAO_CLIENT_TIMEOUT as superseded, and the client keeps the built-in timeout", func() {
+		GinkgoT().Setenv("BAO_CLIENT_TIMEOUT", "1h")
+		client := build()
+		Expect(buf.String()).To(MatchRegexp(infoLine("BAO_CLIENT_TIMEOUT", "the signer's built-in request timeout")))
+		Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
+		Expect(client.ClientTimeout()).To(Equal(cfg.loginTimeout()))
 	})
 
 	// These two are read from the SDK's resulting config rather than the
@@ -346,6 +412,37 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: VAULT_CLIENT_CERT"))
 		Expect(err.Error()).NotTo(ContainSubstring(certPath))
+	})
+
+	// An unencoded "/" in a password ends the authority early, so url.Parse
+	// reads "pa" as a port and its error quotes the URL and that port. The
+	// SDK parses the proxy while reading the environment and the agent
+	// address in NewClient, so each build site gets a case.
+	DescribeTable("withholds a malformed URL from the environment, password included",
+		func(variable, site string) {
+			GinkgoT().Setenv(variable, "http://someuser:pa/ss-secret@host.invalid:3128")
+			_, err := newClient(cfg)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(site))
+			Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: " + variable))
+			Expect(err.Error()).To(ContainSubstring("value withheld"))
+			for _, part := range []string{"someuser", "ss-secret", "pa/", `":pa"`, "host.invalid"} {
+				Expect(err.Error()).NotTo(ContainSubstring(part))
+			}
+		},
+		Entry("BAO_PROXY_ADDR, read with the environment", "BAO_PROXY_ADDR", "building default OpenBao client config"),
+		Entry("BAO_HTTP_PROXY, read with the environment", "BAO_HTTP_PROXY", "building default OpenBao client config"),
+		Entry("BAO_AGENT_ADDR, parsed by NewClient", "BAO_AGENT_ADDR", "creating OpenBao client"),
+	)
+
+	// The withholding is for values the environment supplied; a bad
+	// openbao.addr is the operator's own configuration and keeps its detail.
+	It("keeps the detail when the malformed URL is openbao.addr", func() {
+		cfg.Addr = "http://openbao.invalid:bad-port"
+		_, err := newClient(cfg)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("bad-port"))
+		Expect(err.Error()).NotTo(ContainSubstring("value withheld"))
 	})
 })
 
