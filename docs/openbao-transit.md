@@ -250,7 +250,8 @@ variable that is present but empty still takes precedence, so it hides the
 
 `openvox-ca` deliberately keeps honouring them, so an administrator can still
 use them, but some override the `openbao` settings above. The table lists
-every variable the client reads and which side wins.
+every variable the client reads and which side wins; a test fails if an
+upgrade of the OpenBao client library starts reading one it does not list.
 
 | Variable | What it controls | Which wins |
 | --- | --- | --- |
@@ -285,13 +286,18 @@ certificate variables can hold secrets:
   server certificate verification, since the connection it affects carries
   the login credentials and the token that signs as the CA;
 - a `WARN` line for each other variable in effect, saying what it changes and
-  which `openbao` setting, if any, it overrides;
+  which `openbao` setting, if any, it overrides. A variable with no
+  `openvox-ca` equivalent, such as `BAO_NAMESPACE`, still warns: it changes
+  where the signer's requests go or how they are trusted, and nothing in
+  `openvox-ca`'s own configuration shows it;
 - an `INFO` line for each variable that is set but superseded by `openvox-ca`'s
   configuration, so a variable that seems to be ignored can be explained.
 
 A clean environment logs none of these. The lines appear once each time the
 process holding the OpenBao client starts, and are not repeated when it logs
-in to OpenBao again.
+in to OpenBao again. If a variable stops the client being built at all, such
+as a `BAO_CLIENT_CERT` without `BAO_CLIENT_KEY`, the startup error lists the
+variables that were set, again by name only.
 
 ## Running under an external root CA
 
@@ -616,7 +622,11 @@ local-key custody, where the CA can sign with no external dependency at all.
   unreachable, the credential is wrong/expired, or the auth role/policy
   doesn't grant `read` on `transit/keys/<key_name>`. Check connectivity to
   `openbao.addr`, that the `secret_id`/token/JWT file is present and current,
-  and that the bound role maps to the scoped policy above.
+  and that the bound role maps to the scoped policy above. Check the startup
+  log for `OpenBao client setting taken from the environment` lines too:
+  `BAO_AGENT_ADDR`, `BAO_NAMESPACE` and `BAO_WRAP_TTL` (or their `VAULT_*`
+  spellings) can each cause this; see
+  [OpenBao client environment variables](#openbao-client-environment-variables).
 - **Startup fails with "does not match" / key-rotation errors.** The Transit
   key's public component no longer matches the stored CA certificate — see
   [Key rotation detection](#key-rotation-detection). Point at the correct

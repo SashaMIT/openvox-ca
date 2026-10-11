@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/openbao/openbao/api/v2"
 )
@@ -33,11 +34,13 @@ import (
 // api.DefaultConfig and api.NewClient also read the SDK's BAO_* (and VAULT_*)
 // environment variables. That is deliberate — the administrator decides —
 // but some of them override cfg, so logEnvironment reports every one in
-// effect once the client is built.
+// effect once the client is built. When the environment stops the client
+// being built at all, the error names the variables that were set instead,
+// since the SDK's own message does not always say where its input came from.
 func newClient(cfg Config) (*api.Client, error) {
 	openBaoCfg := api.DefaultConfig()
 	if openBaoCfg.Error != nil {
-		return nil, fmt.Errorf("building default OpenBao client config: %w", openBaoCfg.Error)
+		return nil, fmt.Errorf("building default OpenBao client config%s: %w", envVariablesSetSuffix(), openBaoCfg.Error)
 	}
 	openBaoCfg.Address = cfg.Addr
 	openBaoCfg.Timeout = cfg.loginTimeout()
@@ -55,7 +58,7 @@ func newClient(cfg Config) (*api.Client, error) {
 
 	client, err := api.NewClient(openBaoCfg)
 	if err != nil {
-		return nil, fmt.Errorf("creating OpenBao client: %w", err)
+		return nil, fmt.Errorf("creating OpenBao client%s: %w", envVariablesSetSuffix(), err)
 	}
 	logEnvironment(cfg, openBaoCfg)
 	return client, nil
@@ -63,8 +66,9 @@ func newClient(cfg Config) (*api.Client, error) {
 
 // envVariable is one environment variable the SDK reads into the client
 // newClient builds. The table in docs/openbao-transit.md
-// (#openbao-client-environment-variables) says the same to operators; keep
-// the two in step.
+// (#openbao-client-environment-variables) says the same to operators. Specs
+// in client_env_test.go hold both in step with each other and with the
+// ReadBaoVariable calls in the SDK source go.mod pins (v2.7.1 when written).
 type envVariable struct {
 	// name is the BAO_ spelling. The SDK falls back to the VAULT_ one when
 	// the BAO_ one is absent from the environment.
@@ -249,6 +253,26 @@ func logEnvironment(cfg Config, c *api.Config) {
 		}
 		slog.Warn("OpenBao client setting taken from the environment", attrs...)
 	}
+}
+
+// envVariablesSetSuffix names, for an error message, every variable the SDK
+// reads a non-empty value from — names only, as logEnvironment does — or
+// returns "" when there are none.
+func envVariablesSetSuffix() string {
+	names := []string{api.EnvVaultSkipVerify}
+	for _, v := range envVariables {
+		names = append(names, v.name)
+	}
+	var set []string
+	for _, n := range names {
+		if api.ReadBaoVariable(n) != "" {
+			set = append(set, envSpelling(n))
+		}
+	}
+	if len(set) == 0 {
+		return ""
+	}
+	return " (OpenBao environment variables set: " + strings.Join(set, ", ") + ")"
 }
 
 // envSpelling returns the spelling of name the SDK actually read: the BAO_
