@@ -52,6 +52,15 @@ the launcher's pipe refuses to start rather than proceeding unauthenticated.
 > seconds to produce a valid pre-shared key before the process gives up and says
 > so — and fails at once if it is already at end-of-file or carries anything else.
 
+Because the environment stays readable for the life of the process, the launcher
+also withholds `PUPPET_CA_KEY_PASSPHRASE` from the frontend, along with every
+`BAO_*` and `VAULT_*` variable, which the OpenBao client library reads for itself.
+The signer receives them as before. The rest of the `PUPPET_CA_*` configuration,
+`PUPPET_CA_OPENBAO_*` included, still reaches the frontend, which reads its own
+settings from it; the OpenBao credentials among those settings are file paths,
+not the credentials themselves. `--single-process` has no frontend to withhold
+anything from.
+
 The same isolation is why the shipped systemd unit sets `LimitCORE=0` and
 withholds `$NOTIFY_SOCKET` from the signer — see
 [running under systemd](systemd.md).
@@ -138,6 +147,8 @@ Enable `--encrypt-ca-key` to encrypt the key at rest using AES-256-GCM with an A
 
 1. **`--ca-key-passphrase-file`:** reads the first line of the specified file.
 2. **`PUPPET_CA_KEY_PASSPHRASE`** environment variable: avoids CLI `/proc/cmdline` exposure.
+   Under the default process split only the signer child receives it; see
+   [process isolation](#process-isolation).
 3. **Auto-generated:** if no passphrase source is configured, a cryptographically random
    passphrase is generated and saved to `<cadir>/private/.ca_key_passphrase` (mode `0600`).
    The path is logged at startup so operators know where it is.

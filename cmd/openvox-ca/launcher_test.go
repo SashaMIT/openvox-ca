@@ -788,6 +788,88 @@ var _ = Describe("the environments the launcher builds", func() {
 
 		Expect(internalEnvKeys).To(Equal(before))
 	})
+
+	// The frontend is the network-facing child. It never reads the CA key
+	// passphrase and never talks to OpenBao, so it is handed neither.
+	Context("the frontend", func() {
+		const customVar = "SITE_CA_KEY_PASSPHRASE"
+
+		var secrets []string
+
+		BeforeEach(func() {
+			secrets = []string{
+				ca.DefaultPassphraseEnvVar + "=default-secret",
+				customVar + "=custom-secret",
+				"BAO_TOKEN=bao-token",
+				"VAULT_ADDR=https://openbao.example.com:8200",
+			}
+		})
+
+		withSecrets := func() []string {
+			return append(append([]string(nil), base...), secrets...)
+		}
+
+		It("is not handed the default passphrase variable", func() {
+			Expect(frontendEnv(withSecrets(), ca.DefaultPassphraseEnvVar)).
+				NotTo(ContainElement(HavePrefix(ca.DefaultPassphraseEnvVar + "=")))
+		})
+
+		It("is not handed a passphrase variable configured under another name", func() {
+			Expect(frontendEnv(withSecrets(), customVar)).
+				NotTo(ContainElement(HavePrefix(customVar + "=")))
+		})
+
+		It("is not handed the default passphrase variable when another name is configured", func() {
+			// The launcher cannot tell which of the two the operator set.
+			Expect(frontendEnv(withSecrets(), customVar)).
+				NotTo(ContainElement(HavePrefix(ca.DefaultPassphraseEnvVar + "=")))
+		})
+
+		It("is not handed any BAO_* or VAULT_* variable", func() {
+			env := frontendEnv(withSecrets(), ca.DefaultPassphraseEnvVar)
+
+			Expect(env).NotTo(ContainElement(HavePrefix("BAO_")))
+			Expect(env).NotTo(ContainElement(HavePrefix("VAULT_")))
+		})
+
+		It("keeps everything else, its PUPPET_CA_* configuration included", func() {
+			// The guard against the list widening: the frontend reads its own
+			// configuration from PUPPET_CA_*, and keeps the notification socket
+			// because it is the one that reports READY=1. The neighbours are the
+			// near misses -- names that extend a withheld one, or carry BAO_ in
+			// the middle -- which a prefix or substring match would also take.
+			kept := append(append([]string(nil), base...),
+				ca.DefaultPassphraseEnvVar+"_FILE=/etc/puppet-ca/passphrase",
+				customVar+"_FILE=/etc/puppet-ca/site-passphrase",
+				"PUPPET_CA_OPENBAO_ADDR=https://openbao.example.com:8200",
+				"PUPPET_CA_OPENBAO_TOKEN_FILE=/run/secrets/openbao-token",
+			)
+
+			Expect(frontendEnv(append(append([]string(nil), kept...), secrets...), customVar)).
+				To(Equal(kept))
+		})
+
+		It("does not write through the environment the signer's is built from", func() {
+			// runLauncher builds both children's environments from one baseEnv.
+			// The withheld variables come first: behind every kept one, an
+			// in-place filter would copy each kept entry onto itself and leave
+			// the slice looking untouched.
+			parent := append(append([]string(nil), secrets...), base...)
+			before := append([]string(nil), parent...)
+			frontendEnv(parent, customVar)
+
+			Expect(parent).To(Equal(before))
+		})
+
+		It("leaves the passphrase and the OpenBao settings to the signer", func() {
+			Expect(signerEnv(withSecrets())).To(ContainElements(secrets))
+		})
+
+		It("leaves the passphrase and the OpenBao settings to the daemon child", func() {
+			// The re-executed launcher spawns the signer, which needs them.
+			Expect(daemonEnv(withSecrets())).To(ContainElements(secrets))
+		})
+	})
 })
 
 // The shipped unit encodes numbers derived from constants in this package.
