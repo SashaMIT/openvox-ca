@@ -461,6 +461,8 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: VAULT_CLIENT_CERT"))
 		Expect(err.Error()).NotTo(ContainSubstring(certPath))
+		Expect(err.Error()).To(ContainSubstring("both client cert and client key must be provided"))
+		Expect(err.Error()).NotTo(ContainSubstring("value withheld"))
 	})
 
 	// An unencoded "/" in a password ends the authority early, so url.Parse
@@ -504,6 +506,10 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		_, err := newClient(cfg)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: VAULT_SKIP_VERIFY)"))
+		// Not a URL error, so withholdURL must pass the SDK's message through
+		// rather than relabel it as a proxy failure.
+		Expect(err.Error()).To(ContainSubstring("could not parse BAO_SKIP_VERIFY"))
+		Expect(err.Error()).NotTo(ContainSubstring("value withheld"))
 	})
 
 	// The withholding is for values the environment supplied; a bad
