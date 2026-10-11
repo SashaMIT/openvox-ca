@@ -466,15 +466,28 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 	})
 
 	// otherAcquires has the second replica try for name within d, releasing
-	// it again if it gets it.
+	// it again if it gets it. It runs the attempt in a goroutine because the
+	// process-local mutex ignores contexts: a regression that leaves other's
+	// local lock held must fail the spec, not hang the suite.
 	otherAcquires := func(name string, d time.Duration) error {
-		ctx, cancel := context.WithTimeout(context.Background(), d)
-		defer cancel()
-		ul, err := other.AcquireLock(ctx, name)
-		if err == nil {
-			_ = ul.Unlock()
+		GinkgoHelper()
+		ch := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), d)
+			defer cancel()
+			ul, err := other.AcquireLock(ctx, name)
+			if err == nil {
+				_ = ul.Unlock()
+			}
+			ch <- err
+		}()
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(d + 5*time.Second):
+			Fail(fmt.Sprintf("other's AcquireLock(%q) ignored its %v deadline: its process-local lock is held", name, d))
+			return nil
 		}
-		return err
 	}
 
 	currentSession := func(b *EtcdBackend) *concurrency.Session {
