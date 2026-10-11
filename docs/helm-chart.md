@@ -648,14 +648,14 @@ accept that explicitly:
 kubernetesExport:
   rbac:
     scope: ClusterRole
-    acknowledgeClusterWideSecretCreate: true
+    allowClusterWideSecretCreate: true
 ```
 
 Prefer `Role`. Nothing needs `ClusterRole`: every target names its namespace,
 so listing those under `rbac.namespaces` covers every export the server can
 make. The refusal is a precondition rather than a NOTES warning because
-`helm template`, Argo CD and Flux never show NOTES; an acknowledged install
-still prints one.
+`helm template`, Argo CD and Flux never show NOTES; an install that allows
+the grant still prints one.
 
 The chart mounts the ServiceAccount token automatically when this (or OpenBao's
 Kubernetes auth) is enabled, and leaves it unmounted otherwise. These are the
