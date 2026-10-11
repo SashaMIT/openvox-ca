@@ -276,6 +276,22 @@ standard `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply when no
 `BAO_*` proxy is set, and `SSL_CERT_FILE` and `SSL_CERT_DIR` change the system
 trust store.
 
+At startup, when it builds the client, `openvox-ca` logs which of these
+variables are in effect, by name only, because `BAO_TOKEN` and the
+certificate variables can hold secrets:
+
+- an `ERROR` line when `BAO_SKIP_VERIFY` (or `VAULT_SKIP_VERIFY`) has turned
+  off server certificate verification, since the connection it affects
+  carries the login credentials and the token that signs as the CA;
+- a `WARN` line for each other variable in effect, saying what it changes and
+  which `openbao` setting, if any, it overrides;
+- an `INFO` line for each variable that is set but superseded by `openvox-ca`'s
+  configuration, so a variable that seems to be ignored can be explained.
+
+A clean environment logs none of these. The lines appear once each time the
+process holding the OpenBao client starts, and are not repeated when it logs
+in to OpenBao again.
+
 ## Running under an external root CA
 
 By default openvox-ca generates a self-signed root and issues everything from

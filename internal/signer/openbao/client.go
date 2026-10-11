@@ -19,6 +19,8 @@ package openbao
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 
 	"github.com/openbao/openbao/api/v2"
 )
@@ -27,6 +29,11 @@ import (
 // SDK's own ConfigureTLS (same file-path shape as internal/storage/spec.go's
 // loadBackendTLS); all three of TLSCAFile/TLSCertFile/TLSKeyFile may be empty
 // to use the platform default trust store with no client certificate.
+//
+// api.DefaultConfig and api.NewClient also read the SDK's BAO_* (and VAULT_*)
+// environment variables. That is deliberate — the administrator decides —
+// but some of them override cfg, so logEnvironment reports every one in
+// effect once the client is built.
 func newClient(cfg Config) (*api.Client, error) {
 	openBaoCfg := api.DefaultConfig()
 	if openBaoCfg.Error != nil {
@@ -50,5 +57,203 @@ func newClient(cfg Config) (*api.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating OpenBao client: %w", err)
 	}
+	logEnvironment(cfg, openBaoCfg)
 	return client, nil
+}
+
+// envVariable is one environment variable the SDK reads into the client
+// newClient builds. The table in docs/openbao-transit.md
+// (#openbao-client-environment-variables) says the same to operators; keep
+// the two in step.
+type envVariable struct {
+	// name is the BAO_ spelling. The SDK falls back to the VAULT_ one when
+	// the BAO_ one is absent from the environment.
+	name string
+	// effect says what the variable does to the signer's connection.
+	effect string
+	// overrides names the openvox-ca setting the variable takes the place
+	// of while it is in effect, or is empty when there is none.
+	overrides string
+	// supersededBy returns the openvox-ca setting that leaves the variable
+	// without effect under cfg, or "" when the variable is in effect. Nil
+	// means the environment always decides.
+	supersededBy func(cfg Config) string
+	// inEffect reports, from the SDK's resulting config, whether the value
+	// changed anything. Nil means any value the SDK reads is in effect.
+	inEffect func(c *api.Config) bool
+}
+
+// envVariables lists every variable the SDK reads on the signer's behalf,
+// apart from BAO_SKIP_VERIFY, which logEnvironment reports on its own line.
+var envVariables = []envVariable{
+	{
+		name:         api.EnvVaultAddress,
+		effect:       "OpenBao server address",
+		supersededBy: always("openbao.addr"),
+	},
+	{
+		name:      api.EnvVaultAgentAddr,
+		effect:    "sends every request to this address instead",
+		overrides: "openbao.addr",
+	},
+	{
+		name:         api.EnvVaultClientTimeout,
+		effect:       "per-request timeout",
+		supersededBy: always("the signer's built-in request timeout"),
+	},
+	{
+		name:         api.EnvVaultCACert,
+		effect:       "adds CA certificates trusted for the OpenBao server",
+		supersededBy: caFileSet,
+	},
+	{
+		name:         api.EnvVaultCACertBytes,
+		effect:       "adds CA certificates trusted for the OpenBao server",
+		supersededBy: caFileSet,
+	},
+	{
+		name:         api.EnvVaultCAPath,
+		effect:       "adds CA certificates trusted for the OpenBao server",
+		supersededBy: caFileSet,
+	},
+	{
+		name:         api.EnvVaultClientCert,
+		effect:       "client certificate presented to OpenBao",
+		supersededBy: clientCertSet,
+	},
+	{
+		name:         api.EnvVaultClientCertBytes,
+		effect:       "client certificate presented to OpenBao",
+		supersededBy: clientCertSet,
+	},
+	{
+		name:         api.EnvVaultClientKey,
+		effect:       "client certificate presented to OpenBao",
+		supersededBy: clientCertSet,
+	},
+	{
+		name:         api.EnvVaultClientKeyBytes,
+		effect:       "client certificate presented to OpenBao",
+		supersededBy: clientCertSet,
+	},
+	{
+		name:   api.EnvVaultTLSServerName,
+		effect: "server name sent in TLS SNI and checked against the OpenBao certificate",
+	},
+	{
+		name:   api.EnvHTTPProxy,
+		effect: "proxy every request goes through, unless BAO_PROXY_ADDR is also set",
+	},
+	{
+		name:   api.EnvVaultProxyAddr,
+		effect: "proxy every request goes through",
+	},
+	{
+		name:   api.EnvVaultMaxRetries,
+		effect: "retries after a 5xx response",
+	},
+	{
+		name:   api.EnvRateLimit,
+		effect: "client-side request rate limit",
+	},
+	{
+		name:     api.EnvVaultSRVLookup,
+		effect:   "resolves the server through DNS SRV records when openbao.addr has no port",
+		inEffect: func(c *api.Config) bool { return c.SRVLookup },
+	},
+	{
+		name:     api.EnvVaultDisableRedirects,
+		effect:   "stops the client following a redirect from OpenBao",
+		inEffect: func(c *api.Config) bool { return c.DisableRedirects },
+	},
+	{
+		name:   api.EnvVaultNamespace,
+		effect: "namespace sent with every request, login and signing included",
+	},
+	{
+		name:   api.EnvVaultToken,
+		effect: "token sent with the first login request, until the login replaces it",
+		supersededBy: func(cfg Config) string {
+			if cfg.AuthMethod == AuthToken {
+				return "openbao.token_file"
+			}
+			return ""
+		},
+	},
+	{
+		name:   api.EnvVaultWrapTTL,
+		effect: "asks OpenBao to wrap every response, which the signer cannot use",
+	},
+}
+
+func always(setting string) func(Config) string {
+	return func(Config) string { return setting }
+}
+
+// caFileSet: ConfigureTLS rebuilds the trust pool from openbao.tls_ca_file,
+// discarding whatever the environment added to it.
+func caFileSet(cfg Config) string {
+	if cfg.TLSCAFile != "" {
+		return "openbao.tls_ca_file"
+	}
+	return ""
+}
+
+// clientCertSet: ConfigureTLS replaces the client certificate only when it is
+// given one, so openbao.tls_ca_file alone leaves the environment's in place.
+func clientCertSet(cfg Config) string {
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		return "openbao.tls_cert_file"
+	}
+	return ""
+}
+
+// logEnvironment reports the SDK environment variables behind the client
+// newClient has just built: one warning for each in effect, one info line
+// for each that openvox-ca's configuration supersedes, and an error-level
+// line of its own when server certificate verification is off. It logs
+// variable names only — BAO_TOKEN and the key variables hold secrets.
+//
+// Whether a variable is in effect follows the SDK's own reading: either the
+// resulting config (verification, SRV lookup, redirects) or api.ReadBaoVariable,
+// which is what the SDK calls, so an empty value and the BAO_-masks-VAULT_
+// fallback behave identically here.
+func logEnvironment(cfg Config, c *api.Config) {
+	if tc := c.TLSConfig(); tc != nil && tc.InsecureSkipVerify {
+		attrs := []any{"variable", envSpelling(api.EnvVaultSkipVerify)}
+		if cfg.TLSCAFile != "" {
+			attrs = append(attrs, "overrides", "openbao.tls_ca_file")
+		}
+		slog.Error("OpenBao server certificate verification is OFF for the connection carrying the login and the signing token", attrs...)
+	}
+
+	for _, v := range envVariables {
+		if api.ReadBaoVariable(v.name) == "" {
+			continue
+		}
+		if v.inEffect != nil && !v.inEffect(c) {
+			continue
+		}
+		if v.supersededBy != nil {
+			if setting := v.supersededBy(cfg); setting != "" {
+				slog.Info("OpenBao environment variable has no effect",
+					"variable", envSpelling(v.name), "superseded_by", setting)
+				continue
+			}
+		}
+		attrs := []any{"variable", envSpelling(v.name), "effect", v.effect}
+		if v.overrides != "" {
+			attrs = append(attrs, "overrides", v.overrides)
+		}
+		slog.Warn("OpenBao client setting taken from the environment", attrs...)
+	}
+}
+
+// envSpelling returns the spelling of name the SDK actually read: the BAO_
+// one whenever it is present, even empty, otherwise the VAULT_ fallback.
+func envSpelling(name string) string {
+	if _, ok := os.LookupEnv(name); ok {
+		return name
+	}
+	return api.UpstreamVariableName(name)
 }
