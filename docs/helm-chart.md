@@ -124,10 +124,17 @@ extraEnv:
 ```
 
 Environment variables take precedence over the config file, which is what makes
-this work. Kubernetes substitutes `$(POSTGRES_PASSWORD)` verbatim, so a password
-containing `/`, `?`, `#`, `%` or `@` must be stored URL-encoded for a URL DSN
-like this one. Alternatively, keep the whole DSN in the Secret and set
-`PUPPET_CA_SQL_DSN` itself with `valueFrom.secretKeyRef`.
+this work.
+
+The simplest route for a DSN is to keep all of it in the Secret and set
+`PUPPET_CA_SQL_DSN` itself with `valueFrom.secretKeyRef`. If you splice a
+password in as above, Kubernetes substitutes `$(POSTGRES_PASSWORD)` verbatim,
+so for a URL DSN like this one the Secret must hold the password
+percent-encoded: every character other than a letter, a digit or `-._~`. A
+character URL parsing refuses outright stops the server at startup, and the
+parse error it reports carries the DSN, password included, into the pod log.
+go-sql-driver's `user:password@tcp(…)` form takes the password raw, so leave
+it unencoded there.
 
 Backend credentials must come this way. `config` is rendered into a ConfigMap,
 which anyone allowed to read ConfigMaps in the namespace can read, and which
