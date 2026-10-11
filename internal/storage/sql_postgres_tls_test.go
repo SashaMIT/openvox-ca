@@ -84,6 +84,10 @@ var _ = Describe("PostgreSQL sql_tls_* configuration", func() {
 		Entry("a unix:// DSN", "unix://u:p@ca/var/run/postgresql/.s.PGSQL.5432", "unix socket"),
 		Entry("several hosts", "postgres://u:p@db1.example.com:5432,db2.example.com:5432/ca", "names several"),
 		Entry("several hosts on the default port", "postgres://u:p@db1.example.com,db2.example.com/ca", "names several"),
+		Entry("a port with no host", "postgres://u:p@:5432/ca", "cannot find the PostgreSQL host"),
+		// pgdriver appends the default port only to a host with no colon in
+		// it, so a bracketed IPv6 address without one reaches it portless.
+		Entry("an IPv6 address with no port", "postgres://u:p@[2001:db8::10]/ca", "cannot find the PostgreSQL host"),
 	)
 
 	It("refuses at open time, before any connection is attempted", func() {
