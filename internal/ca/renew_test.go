@@ -418,9 +418,18 @@ var _ = Describe("CA AutoRenew", func() {
 		before := time.Now().UTC()
 		certPEM, err := myCA.Sign(ctx, "backdate-csr-node")
 		Expect(err).NotTo(HaveOccurred())
+		after := time.Now().UTC()
 		cert := parseCertPEM(certPEM)
 
-		Expect(cert.NotBefore).To(BeTemporally("<=", before.Add(-7*time.Minute)),
+		// The upper bound is anchored on `after`, not `before`, and that is
+		// load-bearing rather than tidiness. X.509 stores NotBefore to whole
+		// seconds, so it is floor(t_issue - backdate) for some t_issue in
+		// [before, after]. Anchored on `before`, a second boundary falling
+		// between `before` and the signature puts the floored value AFTER the
+		// bound and the spec fails for a reason that has nothing to do with the
+		// backdate. Anchored on `after` it always holds:
+		// floor(t_issue - 7m) <= t_issue - 7m <= after - 7m.
+		Expect(cert.NotBefore).To(BeTemporally("<=", after.Add(-7*time.Minute)),
 			"the configured backdate must reach the CSR-signing path")
 		Expect(cert.NotBefore).To(BeTemporally(">", before.Add(-7*time.Minute-2*time.Minute)),
 			"and must not exceed it; a hardcoded 24h or a wider default would land here")
@@ -442,9 +451,11 @@ var _ = Describe("CA AutoRenew", func() {
 		before := time.Now().UTC()
 		renewedPEM, err := myCA.AutoRenew(ctx, original)
 		Expect(err).NotTo(HaveOccurred())
+		after := time.Now().UTC()
 		renewed := parseCertPEM(renewedPEM)
 
-		Expect(renewed.NotBefore).To(BeTemporally("<=", before.Add(-7*time.Minute)),
+		// Anchored on `after` for the whole-second reason given above.
+		Expect(renewed.NotBefore).To(BeTemporally("<=", after.Add(-7*time.Minute)),
 			"the configured backdate must reach the auto-renewal path")
 		Expect(renewed.NotBefore).To(BeTemporally(">", before.Add(-7*time.Minute-2*time.Minute)),
 			"and must not exceed it")
