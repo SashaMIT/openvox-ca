@@ -18,6 +18,7 @@
 package ca_test
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -28,7 +29,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/url"
@@ -67,6 +70,8 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 	// with an extension anything here interprets.
 	oidKept := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}
 	oidAsked := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 2}
+	oidAKI := asn1.ObjectIdentifier{2, 5, 29, 35}
+	oidBasicConstraints := asn1.ObjectIdentifier{2, 5, 29, 19}
 
 	// The extensions issueLeafLocked sets afresh on every certificate, which a
 	// renewal therefore does not copy: authority and subject key identifiers,
@@ -82,6 +87,17 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			}
 		}
 		return out
+	}
+
+	extOf := func(cert *x509.Certificate, oid asn1.ObjectIdentifier) pkix.Extension {
+		GinkgoHelper()
+		for _, ext := range cert.Extensions {
+			if ext.Id.Equal(oid) {
+				return ext
+			}
+		}
+		Fail("certificate carries no " + oid.String() + " extension")
+		return pkix.Extension{}
 	}
 
 	extValue := func(cert *x509.Certificate, oid asn1.ObjectIdentifier) ([]byte, bool) {
@@ -161,11 +177,18 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			URIs:                  []*url.URL{uri},
 			KeyUsage:              x509.KeyUsageDigitalSignature,
 			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-			BasicConstraintsValid: true,
 			SubjectKeyId:          []byte{1, 2, 3, 4},
 			CRLDistributionPoints: []string{"http://old.example/crl"},
 			OCSPServer:            []string{"http://old.example/ocsp"},
 			ExtraExtensions: []pkix.Extension{
+				// An authority key identifier naming no key this CA holds, and
+				// basic constraints marked non-critical, which issueLeafLocked
+				// never builds: so a renewal that carried either rather than
+				// setting it afresh would show it.
+				{Id: oidAKI, Value: marshal(struct {
+					ID []byte `asn1:"optional,tag:0"`
+				}{ID: []byte{9, 9, 9, 9}})},
+				{Id: oidBasicConstraints, Critical: false, Value: marshal(struct{}{})},
 				{Id: ppRole, Value: marshal("web")},
 				{Id: ca.OIDPpCliAuth, Value: marshal("true")},
 				{Id: oidKept, Value: marshal("kept")},
@@ -179,6 +202,10 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 		// original, or that spec would pass on an absence.
 		Expect(carriedOf(original)).To(HaveLen(6),
 			"the original must carry SANs, key usage, extended key usage, pp_role, pp_cli_auth and one non-Puppet extension")
+		// Likewise each refreshed value must differ from the one the CA would
+		// build, or the spec that says it is set afresh would pass on a copy.
+		Expect(original.AuthorityKeyId).NotTo(Equal(myCA.CACert.SubjectKeyId))
+		Expect(extOf(original, oidBasicConstraints).Critical).To(BeFalse())
 
 		// Set after minting, so the renewed certificate's pointers can only
 		// have come from here.
@@ -300,7 +327,102 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 		Expect(renewed.AuthorityKeyId).To(Equal(myCA.CACert.SubjectKeyId))
 		Expect(renewed.BasicConstraintsValid).To(BeTrue())
 		Expect(renewed.IsCA).To(BeFalse())
+		Expect(extOf(renewed, oidBasicConstraints).Critical).To(BeTrue(),
+			"basic constraints must be the CA's own, not the original's non-critical copy")
 		Expect(renewed.CRLDistributionPoints).To(Equal([]string{"http://new.example/crl"}))
 		Expect(renewed.OCSPServer).To(Equal([]string{"http://new.example/ocsp"}))
+	})
+
+	It("drops the original's CRL and OCSP pointers when the CA publishes neither", func() {
+		myCA.CRLURLs = nil
+		myCA.OCSPURLs = nil
+		certPEM, err := myCA.AutoRenew(ctx, original)
+		Expect(err).NotTo(HaveOccurred())
+		renewed := parse(certPEM)
+		Expect(renewed.CRLDistributionPoints).To(BeEmpty())
+		Expect(renewed.OCSPServer).To(BeEmpty())
+	})
+
+	Context("when the original carries no key usage or extended key usage", func() {
+		// Both absent means unrestricted. A renewal gives it the CA's defaults
+		// instead, which can only narrow it.
+		var bare *x509.Certificate
+
+		BeforeEach(func() {
+			myCA.AllowSubjectAltNames = true
+			serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+			Expect(err).NotTo(HaveOccurred())
+			key := newKey()
+			der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+				SerialNumber: serial,
+				Subject:      pkix.Name{CommonName: subject},
+				NotBefore:    time.Now().Add(-time.Hour),
+				NotAfter:     time.Now().Add(24 * time.Hour),
+				DNSNames:     []string{subject},
+			}, myCA.CACert, &key.PublicKey, myCA.CAKey)
+			Expect(err).NotTo(HaveOccurred())
+			bare, err = x509.ParseCertificate(der)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bare.KeyUsage).To(BeZero())
+			Expect(bare.ExtKeyUsage).To(BeEmpty())
+		})
+
+		DescribeTable("gives it the CA's default key usage and extended key usage",
+			func(renew func() ([]byte, error)) {
+				certPEM, err := renew()
+				Expect(err).NotTo(HaveOccurred())
+				renewed := parse(certPEM)
+				Expect(renewed.KeyUsage).To(Equal(x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment))
+				Expect(renewed.ExtKeyUsage).To(ConsistOf(x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth))
+			},
+			Entry("on auto-renewal", func() ([]byte, error) { return myCA.AutoRenew(ctx, bare) }),
+			Entry("on a re-key", func() ([]byte, error) { return myCA.Renew(ctx, subject, renewalCSR(newKey()), bare) }),
+		)
+	})
+
+	Context("when the original carries an authorisation extension", func() {
+		// The line an operator alerts on for a freshly minted administrator
+		// credential must be written for a renewed one too, and must say
+		// whether the grant moved to a new key.
+		var logged *bytes.Buffer
+
+		BeforeEach(func() {
+			myCA.AllowSubjectAltNames = true
+			logged = &bytes.Buffer{}
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(logged, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			DeferCleanup(func() { slog.SetDefault(orig) })
+		})
+
+		grantRecords := func() []map[string]any {
+			GinkgoHelper()
+			var out []map[string]any
+			for _, line := range bytes.Split(bytes.TrimSpace(logged.Bytes()), []byte("\n")) {
+				if len(line) == 0 {
+					continue
+				}
+				var rec map[string]any
+				Expect(json.Unmarshal(line, &rec)).To(Succeed())
+				if rec["msg"] == "Issued certificate carrying a Puppet authorisation extension" {
+					out = append(out, rec)
+				}
+			}
+			return out
+		}
+
+		DescribeTable("logs the grant at WARN, naming the kind of renewal",
+			func(renew func() ([]byte, error), kind string) {
+				_, err := renew()
+				Expect(err).NotTo(HaveOccurred())
+				recs := grantRecords()
+				Expect(recs).To(HaveLen(1), logged.String())
+				Expect(recs[0]).To(HaveKeyWithValue("level", "WARN"))
+				Expect(recs[0]).To(HaveKeyWithValue("subject", subject))
+				Expect(recs[0]).To(HaveKeyWithValue("grant", "pp_cli_auth=true"))
+				Expect(recs[0]).To(HaveKeyWithValue("renewal", kind))
+			},
+			Entry("on a re-key", func() ([]byte, error) { return myCA.Renew(ctx, subject, renewalCSR(newKey()), original) }, "re-key"),
+			Entry("on auto-renewal", func() ([]byte, error) { return myCA.AutoRenew(ctx, original) }, "same key"),
+		)
 	})
 })

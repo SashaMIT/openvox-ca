@@ -502,11 +502,9 @@ reachable.
 
 Renewal reissues under
 this CA's authority using the presented certificate's own subject, so it is
-only meaningful for names this CA assigned. (Extensions differ by path, and on both
-paths only Puppet OID extensions are carried at all: the empty-body form
-carries the presented certificate's SANs and Puppet OIDs forward unchanged,
-while the CSR form takes Puppet OIDs from the CSR and strips authorization-arc
-ones.)
+only meaningful for names this CA assigned. Both forms carry its extensions
+forward too, authorization-arc ones included, and the CSR form takes only the
+new public key from its CSR; see [certificate renewal](api.md#certificate-renewal).
 
 In the default topology every certificate an agent holds was issued by this CA,
 so nothing changes. A certificate issued by a *previous* CA whose material was

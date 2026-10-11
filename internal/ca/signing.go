@@ -20,6 +20,7 @@ package ca
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/x509"
@@ -30,6 +31,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"math/big"
 	"net"
 	"net/url"
@@ -298,17 +300,13 @@ var ErrDisallowedSubjectAltNames = errors.New("CSR requests subject alternative 
 // authorisation baseline pins that.
 //
 // Renewal reissues under this CA's authority using the presented certificate's
-// own subject — and, on the empty-body path only, its Puppet OID extensions.
-// That is safe only while this CA is the only thing that could have produced
-// it: the subject was drawn from a namespace we control, and on that path the
-// extensions were vetted by us at issuance. Neither holds for a certificate
-// some other CA issued, so renewing one would let its issuer choose names, and
-// attributes, inside our namespace.
-//
-// The CSR path does not rely on prior vetting for its extensions — it takes
-// them from the submitted CSR and strips the authorisation arc — but it still
-// needs this gate for the subject, which it reissues from the presented
-// certificate's namespace.
+// own subject and every one of its extensions, on both paths (see
+// reissueLeafLocked); a re-key CSR contributes only its public key. That is
+// safe only while this CA is the only thing that could have produced it: the
+// subject was drawn from a namespace we control, and the extensions — the
+// authorisation arc included — were vetted by us at issuance. Neither holds
+// for a certificate some other CA issued, so renewing one would let its issuer
+// choose names, attributes and authority inside our namespace.
 //
 // CheckSignatureFrom answers "did we issue this" with a signature check rather
 // than an issuer-name comparison, because a distinguished name is not a
@@ -395,8 +393,10 @@ func asciiLower(s string) string {
 	return string(b)
 }
 
-// sanStrings renders a SAN set as canonical "type:value" strings, so entries of
-// different kinds can be compared and reported as one set.
+// sanStrings renders a SAN set as "type:value" strings, so entries of
+// different kinds can be reported as one set. The only comparison made on them
+// is checkSubjectAltNames' test for the subject's own DNS name; the rest are
+// refused as they stand and rendered for the log record.
 //
 // Only DNS names are case-folded, because only DNS names are case-insensitive
 // by specification, and they are folded as ASCII rather than as Unicode.
@@ -415,22 +415,8 @@ func asciiLower(s string) string {
 // are identical. asciiLower is kept because it is the fold DNS actually
 // specifies -- correct by construction rather than by an encoding rule enforced
 // two layers away -- and because a future caller building a SAN set in Go
-// rather than parsing one would not inherit that guarantee. Email local-parts and URI paths are not, so they are
-// compared verbatim: over-folding here would make two entries that a TLS peer
-// treats as different compare equal, and every such comparison in this file
-// decides whether something is already permitted. Where the normalisation is
-// unsure, it must say "different" and let the gate refuse. A URI is compared on
-// its unnormalised String() for that reason: two spellings of one resource read
-// as two names, and the gate refuses rather than guesses.
-//
-// IP addresses go through net.IP.String() so the comparison is on a canonical
-// form rather than on raw bytes. That is defensive rather than load-bearing:
-// every address reaching this function has been through DER, and encoding
-// normalises an IPv4 address to four octets, so an IPv4-in-IPv6 spelling has
-// already collapsed to the same value by the time it arrives. Nothing on this
-// path can observe the difference -- which is why no spec pins it. It stays
-// because a future caller that builds a SAN set in Go rather than parsing one
-// would not have that guarantee.
+// rather than parsing one would not inherit that guarantee. Email, URI and IP
+// entries are rendered as they stand, net.IP.String() for an address.
 func sanStrings(dns []string, ips []net.IP, emails []string, uris []*url.URL) []string {
 	out := make([]string, 0, len(dns)+len(ips)+len(emails)+len(uris))
 	for _, d := range dns {
@@ -706,9 +692,10 @@ func (c *CA) issueLeafLocked(ctx context.Context, subject string, subjectName pk
 	// SECURITY: Enforce the CA's key-strength policy (RSA >= 2048, ECDSA on an
 	// approved NIST curve), mirroring the policy ValidateKeyConfig applies to
 	// server-side key generation. This is the issuance chokepoint every path
-	// shares — a submitted CSR (signWithDuration), an already-issued
-	// certificate's key (AutoRenew), and a freshly generated one
-	// (GenerateWithOptions) — so no signing path can produce a certificate over
+	// shares — a submitted CSR (signWithDuration), a renewal's key, whether the
+	// presented certificate's own or a re-key CSR's (reissueLeafLocked), and a
+	// freshly generated one (GenerateWithOptions, issueManagedUnderSubjectLock)
+	// — so no signing path can produce a certificate over
 	// a weak key without deleting this check. It runs before the serial is
 	// allocated and before anything is written, so a rejected key consumes
 	// nothing. NIST 800-53: SC-12, SC-13 (Cryptographic Protection)
@@ -944,7 +931,29 @@ func (c *CA) reissueLeafLocked(ctx context.Context, subject string, original *x5
 		}
 		carried = append(carried, ext)
 	}
-	return c.issueLeafLocked(ctx, subject, original.Subject, pubKey, subjectAltNames{}, carried, nil, 0)
+	certPEM, err := c.issueLeafLocked(ctx, subject, original.Subject, pubKey, subjectAltNames{}, carried, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// SECURITY: record every authorisation grant this renewal carried, with
+	// the line GenerateWithOptions writes for a fresh one, so an operator
+	// alerting on it sees an administrator credential renewed as well as one
+	// minted. It matters most on a re-key, which puts the grant on a key this
+	// CA has never seen; the renewal attribute says which happened. Logged
+	// straight after issueLeafLocked, as GenerateWithOptions does, so nothing
+	// later can return early and lose it.
+	// NIST 800-53: AC-6 (Least Privilege), AU-2 (Event Logging)
+	renewal := "re-key"
+	if k, ok := original.PublicKey.(interface{ Equal(crypto.PublicKey) bool }); ok && k.Equal(pubKey) {
+		renewal = "same key"
+	}
+	grants := AuthExtensionMap(carried)
+	for _, name := range slices.Sorted(maps.Keys(grants)) {
+		slog.Warn("Issued certificate carrying a Puppet authorisation extension",
+			"subject", subject, "grant", name+"="+grants[name], "renewal", renewal)
+	}
+	return certPEM, nil
 }
 
 // Clean revokes (if signed) and removes both the certificate and any pending CSR
