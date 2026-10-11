@@ -63,6 +63,9 @@ var _ = Describe("PostgreSQL sql_tls_* configuration", func() {
 		Entry("an IPv4 address", "postgres://u:p@192.0.2.10:5432/ca", "192.0.2.10"),
 		Entry("an IPv6 address", "postgres://u:p@[2001:db8::10]:5432/ca", "2001:db8::10"),
 		Entry("no host, so the driver's localhost default", "postgres://u:p@/ca", "localhost"),
+		// pgdriver applies host= after the URL's host, so host= is what it
+		// dials, and so what must be verified.
+		Entry("a TCP host= overriding the URL's host", "postgres://u:p@decoy.example.com:5432/ca?host=real.example.com:5432", "real.example.com"),
 		// sslmode=require on its own means "encrypt, do not verify", and
 		// pgdriver builds an InsecureSkipVerify config for it. The files must
 		// replace that rather than inherit it.
