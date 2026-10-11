@@ -235,11 +235,14 @@ Server CA, so you can swap in `openvox-ca` without reorganising your SSL tree:
 
 (The directory also holds small internal integrity files; leave them in place.)
 File permissions are fixed: `0600` for `ca_key.pem`, `inventory.txt`, the
-integrity files, `ca_crl.pem` and `superseded.json`, for anything under
-`private/` and for the lock files under `locks/`; `0644` for certificates,
-CSRs, `ca_crt.pem`, `ca_pub.pem` and `serial`. A file openvox-ca rewrites gets
-its mode, so a cleanup that drops expired lines from an `inventory.txt` OpenVox
-Server created leaves it `0600` where it was `0640`.
+integrity files and `superseded.json`, for anything under `private/` and for
+the lock files under `locks/`; `0644` for certificates, CSRs, `ca_crt.pem`,
+`ca_pub.pem`, `ca_crl.pem` and `serial`. The CRL is world-readable because it is
+public: it is served without authentication, and OpenVox Server writes it
+`0644` too. The inventory is not, because it names every subject this CA has
+signed. A file openvox-ca rewrites gets its mode, so a cleanup that drops
+expired lines from an `inventory.txt` OpenVox Server created leaves it `0600`
+where it was `0640`.
 `openvox-ca` warns at startup about `ca_key.pem` and any `*_key.pem` in
 `private/` whose permissions are looser than `0600` and leaves them for you to
 fix.

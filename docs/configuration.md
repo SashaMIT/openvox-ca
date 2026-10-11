@@ -1425,11 +1425,10 @@ store the same logical state elsewhere.
 | --- | --- |
 | Directories | `0750` |
 | Private keys | `0600` |
-| CRL file | `0600` |
 | Inventory and its integrity value | `0600` |
 | Pending-supersession list | `0600` |
 | Lock files under `locks/` | `0600` |
-| Public data (certs, CSRs, CA certificate) | `0644` |
+| Public data (certs, CSRs, CA certificate, CRL) | `0644` |
 
 The user running `openvox-ca` must own (or have write access to) `--cadir` —
 and so must anything else that touches the store. `openvox-ca-ctl` and the
