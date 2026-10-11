@@ -680,6 +680,9 @@ name the host the DSN connects to. These options need a single TCP host, so
 `openvox-ca` refuses to open the database with them alongside a Unix-socket
 DSN, which PostgreSQL does not serve over TLS, or a DSN naming several hosts.
 
+Both `sslrootcert` and the `sql_tls_*_file` options are read once, when
+`openvox-ca` opens the database, so rotating the database's CA needs a restart.
+
 ```text
 --storage-backend postgres
 --sql-dsn         'postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=verify-full&sslrootcert=/etc/puppet-ca/pg-ca.pem'

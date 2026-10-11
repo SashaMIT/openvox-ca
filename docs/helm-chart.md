@@ -142,6 +142,12 @@ CA in `sslrootcert` and names the host in the DSN, so mount that CA alongside.
 [the PostgreSQL backend](storage-backends.md#postgresql-backend). Project only
 the CA certificate, as above, when the Secret also holds the CA's key.
 
+The CA is read once, when openvox-ca opens the database, and `SIGHUP` does not
+reopen it (see [reloading configuration](configuration.md#reloading-configuration)).
+Rotating the database's CA therefore needs a pod restart; the Reloader
+annotation described under [TLS](#tls-the-charts-most-important-setting) is one
+way to get it.
+
 ## Choosing an image
 
 The chart defaults to the **Alpine** image variant. With `image.tag` empty it
