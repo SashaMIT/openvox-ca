@@ -156,8 +156,6 @@ var contractExceptions = map[string][]contractException{
 		"kept: a subject that is not a valid certname is the client's error"}},
 	"status-put-revoke-unknown": {{"status: 409, upstream 404",
 		"#358 (PR #372): revoking a subject the CA never signed answers 409"}},
-	"status-put-sign-without-csr": {{"status: 404, upstream 409",
-		"#411: signing a subject with no CSR answers 404"}},
 	"certificate-get-not-modified": {{"status: 200, upstream 304",
 		"#414: GET /certificate ignores If-Modified-Since"}},
 	"certificate-request-put-existing-cert": {{"status: 200, upstream 400",
