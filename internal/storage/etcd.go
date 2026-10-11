@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math/rand/v2"
@@ -97,6 +98,15 @@ type EtcdBackend struct {
 	// re-created when its lease has expired. Protected by sessionMu.
 	sessionMu sync.Mutex
 	session   *concurrency.Session
+	// sessionCtx is the context every session's keepalive runs on, and
+	// Close cancels it. It belongs to the backend, never to a caller: the
+	// session is shared by every lock this backend takes, so it outlives
+	// the AcquireLock call that happened to create it (#442).
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
+	// lockTTL is the session lease's TTL in seconds: etcdLockTTLSeconds,
+	// which the suite lowers so a lapse is observable without a 30s wait.
+	lockTTL int
 
 	// localLocks holds a *sync.Mutex per lock name. etcd's concurrency.Mutex
 	// is *not* safe for re-entry by multiple goroutines sharing a single
@@ -111,6 +121,9 @@ type EtcdBackend struct {
 // Unlock, the lock is released automatically after this TTL expires so
 // the cluster does not wedge.
 const etcdLockTTLSeconds = 30
+
+// errEtcdBackendClosed refuses a lock asked of a backend after Close.
+var errEtcdBackendClosed = errors.New("etcd backend is closed")
 
 // etcdLayout maps logical keys to their physical etcd sub-paths. CSR and
 // signed-cert keys are handled directly in physicalKey. KeyInventory's
@@ -143,12 +156,9 @@ func NewEtcdBackend(cfg EtcdConfig) (*EtcdBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connecting to etcd: %w", err)
 	}
-	return &EtcdBackend{
-		client:  cli,
-		owned:   true,
-		prefix:  cfg.KeyPrefix,
-		timeout: cfg.RequestTimeout,
-	}, nil
+	b := newEtcdBackend(cli, cfg)
+	b.owned = true
+	return b, nil
 }
 
 // NewEtcdBackendFromClient wraps an existing etcd client. The backend does
@@ -157,10 +167,19 @@ func NewEtcdBackend(cfg EtcdConfig) (*EtcdBackend, error) {
 func NewEtcdBackendFromClient(cli *clientv3.Client, keyPrefix string, requestTimeout time.Duration) *EtcdBackend {
 	cfg := EtcdConfig{KeyPrefix: keyPrefix, RequestTimeout: requestTimeout}
 	cfg.applyDefaults()
+	return newEtcdBackend(cli, cfg)
+}
+
+// newEtcdBackend builds a backend over cli from a defaulted cfg.
+func newEtcdBackend(cli *clientv3.Client, cfg EtcdConfig) *EtcdBackend {
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	return &EtcdBackend{
-		client:  cli,
-		prefix:  cfg.KeyPrefix,
-		timeout: cfg.RequestTimeout,
+		client:        cli,
+		prefix:        cfg.KeyPrefix,
+		timeout:       cfg.RequestTimeout,
+		lockTTL:       etcdLockTTLSeconds,
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
 	}
 }
 
@@ -448,6 +467,18 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 		local.Unlock()
 		return nil, fmt.Errorf("locking %q: %w", name, err)
 	}
+	// Lock only checks that its key still exists, which it does until the
+	// lease expires on the server, so it can succeed on a session whose
+	// keepalive has already stopped. Granting that lock would let the
+	// caller start a read-modify-write that another replica can enter
+	// within the TTL. Give the key back and refuse instead.
+	select {
+	case <-sess.Done():
+		ul := &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}
+		_ = ul.Unlock()
+		return nil, fmt.Errorf("locking %q: %w", name, concurrency.ErrSessionExpired)
+	default:
+	}
 	return &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}, nil
 }
 
@@ -462,10 +493,15 @@ func (b *EtcdBackend) localLockFor(name string) *sync.Mutex {
 }
 
 // ensureSession returns the current concurrency session, creating or
-// replacing it as needed. Safe for concurrent callers.
+// replacing it as needed. Safe for concurrent callers. ctx bounds only the
+// lease grant: the session runs on the backend's own context, because every
+// later caller shares it.
 func (b *EtcdBackend) ensureSession(ctx context.Context) (*concurrency.Session, error) {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
+	if b.sessionCtx.Err() != nil {
+		return nil, errEtcdBackendClosed
+	}
 	if b.session != nil {
 		select {
 		case <-b.session.Done():
@@ -475,9 +511,16 @@ func (b *EtcdBackend) ensureSession(ctx context.Context) (*concurrency.Session, 
 			return b.session, nil
 		}
 	}
+	grantCtx, cancel := b.callCtx(ctx)
+	defer cancel()
+	lease, err := b.client.Grant(grantCtx, int64(b.lockTTL))
+	if err != nil {
+		return nil, fmt.Errorf("granting etcd lock lease: %w", err)
+	}
 	sess, err := concurrency.NewSession(b.client,
-		concurrency.WithTTL(etcdLockTTLSeconds),
-		concurrency.WithContext(ctx),
+		concurrency.WithLease(lease.ID),
+		concurrency.WithTTL(b.lockTTL),
+		concurrency.WithContext(b.sessionCtx),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating etcd lock session: %w", err)
@@ -505,12 +548,19 @@ func (u *etcdUnlocker) Unlock() error {
 }
 
 // Close releases the underlying etcd client when owned by this backend,
-// and always closes the lock session if one was created.
+// and always closes the lock session if one was created. Later lock
+// acquisitions fail with errEtcdBackendClosed.
 func (b *EtcdBackend) Close() error {
 	b.sessionMu.Lock()
 	if b.session != nil {
+		// Before cancelling sessionCtx: Session.Close revokes the lease
+		// under it, and a cancelled one would leave every lock this
+		// backend holds to wait out the TTL instead.
 		_ = b.session.Close()
 		b.session = nil
+	}
+	if b.sessionCancel != nil {
+		b.sessionCancel()
 	}
 	b.sessionMu.Unlock()
 	if !b.owned || b.client == nil {

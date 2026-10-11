@@ -36,6 +36,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.etcd.io/etcd/server/v3/embed"
 )
 
@@ -413,6 +414,163 @@ var _ = Describe("EtcdBackendAcquireLockSerialisesConcurrentCallers", func() {
 		}
 		wg.Wait()
 		Expect(maxConcurrent.Load()).To(Equal(int32(1)), "maxConcurrent = %d, want 1 (lock did not serialise writers)", maxConcurrent.Load())
+	})
+})
+
+// EtcdBackendLockSessionLifetime pins the lifetime of the lease-backed
+// session every lock on a backend shares (#442). The session outlives the
+// AcquireLock call that happened to create it, so it must not be bound to
+// that call's context; and a lock is only granted on a session that is still
+// renewing its lease.
+var _ = Describe("EtcdBackendLockSessionLifetime", func() {
+	const (
+		prefix = "/test-lock-lifetime"
+		// The server raises any lease TTL below 1.5 election timeouts to
+		// that floor, which on the embedded server's defaults is 2s.
+		shortTTL = 2
+		// lapseWindow is long enough for a lease nobody renews to expire
+		// and for the server to hand its lock to the next waiter: the
+		// twin spec below holds the harness to that.
+		lapseWindow = 3 * shortTTL * time.Second
+	)
+
+	var (
+		cli   *clientv3.Client
+		a     *EtcdBackend
+		other *EtcdBackend
+	)
+
+	BeforeEach(func() {
+		var stop func()
+		cli, stop = startEmbeddedEtcd()
+		DeferCleanup(stop)
+		a = newBackend(cli, prefix)
+		other = newBackend(cli, prefix)
+		a.lockTTL = shortTTL
+		other.lockTTL = shortTTL
+		DeferCleanup(other.Close)
+		DeferCleanup(a.Close)
+	})
+
+	// otherAcquires has the second replica try for name within d, releasing
+	// it again if it gets it.
+	otherAcquires := func(name string, d time.Duration) error {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		ul, err := other.AcquireLock(ctx, name)
+		if err == nil {
+			_ = ul.Unlock()
+		}
+		return err
+	}
+
+	currentSession := func(b *EtcdBackend) *concurrency.Session {
+		b.sessionMu.Lock()
+		defer b.sessionMu.Unlock()
+		return b.session
+	}
+
+	Context("when the call that created the session has returned", func() {
+		It("keeps a lock held on that session past the lease TTL", func() {
+			firstCtx, cancelFirst := context.WithCancel(context.Background())
+			ulFirst, err := a.AcquireLock(firstCtx, "subject:first")
+			Expect(err).NotTo(HaveOccurred(), "first AcquireLock")
+			ulHeld, err := a.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+			DeferCleanup(ulHeld.Unlock)
+
+			// The request that created the session finishes, as every
+			// CA request path does: unlock, then cancel its context.
+			Expect(ulFirst.Unlock()).To(Succeed(), "first Unlock")
+			cancelFirst()
+
+			Expect(otherAcquires("crl", lapseWindow)).To(MatchError(context.DeadlineExceeded),
+				"another replica took crl while this one still held it: the session lease lapsed with its creator's context")
+		})
+
+		It("hands the lock over within that window once the lease stops being renewed", func() {
+			_, err := a.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+
+			currentSession(a).Orphan()
+
+			Expect(otherAcquires("crl", lapseWindow)).To(Succeed(),
+				"a lease nobody renews must lapse within the window, or the spec above cannot fail")
+		})
+	})
+
+	Context("when the session lapses while an acquisition waits", func() {
+		type acquired struct {
+			ul  Unlocker
+			err error
+		}
+		var res acquired
+
+		BeforeEach(func() {
+			// Long enough that the orphaned lease, and the waiter key it
+			// carries, outlive everything the specs below assert.
+			a.lockTTL = 10
+
+			ulOther, err := other.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "other AcquireLock")
+
+			ch := make(chan acquired, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				ul, err := a.AcquireLock(ctx, "crl")
+				ch <- acquired{ul: ul, err: err}
+			}()
+
+			// Wait until a has queued its own key behind other's.
+			Eventually(func() (int64, error) {
+				resp, err := cli.Get(context.Background(), prefix+"/locks/crl/", clientv3.WithPrefix(), clientv3.WithCountOnly())
+				if err != nil {
+					return 0, err
+				}
+				return resp.Count, nil
+			}).WithTimeout(5 * time.Second).Should(Equal(int64(2)))
+
+			// The keepalive stops, but the lease is still live on the
+			// server, so the queued key survives and Lock goes on to win.
+			currentSession(a).Orphan()
+			Expect(ulOther.Unlock()).To(Succeed(), "other Unlock")
+
+			Eventually(ch).WithTimeout(5 * time.Second).Should(Receive(&res))
+			if res.ul != nil {
+				DeferCleanup(res.ul.Unlock)
+			}
+		})
+
+		It("refuses the lock rather than grant it on a lease nobody renews", func() {
+			Expect(res.err).To(MatchError(concurrency.ErrSessionExpired))
+		})
+
+		It("gives up its place, so other replicas need not wait out the lease", func() {
+			Expect(otherAcquires("crl", time.Second)).To(Succeed())
+		})
+	})
+
+	Context("when the backend is closed", func() {
+		BeforeEach(func() {
+			a.lockTTL = 10
+		})
+
+		It("revokes the lease, so a lock it still held frees at once", func() {
+			_, err := a.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+
+			Expect(a.Close()).To(Succeed())
+
+			Expect(otherAcquires("crl", time.Second)).To(Succeed())
+		})
+
+		It("refuses to start a new session", func() {
+			Expect(a.Close()).To(Succeed())
+
+			_, err := a.AcquireLock(context.Background(), "crl")
+			Expect(err).To(MatchError(errEtcdBackendClosed))
+		})
 	})
 })
 
