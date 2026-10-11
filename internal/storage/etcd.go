@@ -92,6 +92,10 @@ type EtcdBackend struct {
 	pruneBatchHook   func()
 	importBatchHook  func()
 	mutateRecordHook func()
+	// unlockHook, when non-nil, runs before each attempt to delete a lock
+	// key; an error from it stands in for a failed delete. Test seam only:
+	// it drives the release-retry path without an etcd outage.
+	unlockHook func() error
 
 	// session is the lease-backed concurrency session used for distributed
 	// mutexes. It is created lazily on the first AcquireLock call and
@@ -474,11 +478,15 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 	// within the TTL. Give the key back and refuse instead.
 	select {
 	case <-sess.Done():
-		ul := &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}
+		ul := b.newUnlocker(sess, mu, local)
 		return nil, fmt.Errorf("locking %q: %w", name, errors.Join(concurrency.ErrSessionExpired, ul.Unlock()))
 	default:
 	}
-	return &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}, nil
+	return b.newUnlocker(sess, mu, local), nil
+}
+
+func (b *EtcdBackend) newUnlocker(sess *concurrency.Session, mu *concurrency.Mutex, local *sync.Mutex) *etcdUnlocker {
+	return &etcdUnlocker{sess: sess, mu: mu, local: local, timeout: b.timeout, hook: b.unlockHook}
 }
 
 // localLockFor returns the process-local mutex for lock name, creating it
@@ -528,22 +536,67 @@ func (b *EtcdBackend) ensureSession(ctx context.Context) (*concurrency.Session, 
 	return sess, nil
 }
 
+// etcdUnlockRetryInterval is how long a failed lock release waits before
+// trying to delete the key again.
+const etcdUnlockRetryInterval = 500 * time.Millisecond
+
 // etcdUnlocker wraps concurrency.Mutex (the distributed lock) plus the
-// process-local mutex acquired in AcquireLock. The local mutex is always
-// released, even if the distributed unlock fails, so a transient etcd
-// error cannot wedge subsequent in-process callers.
+// process-local mutex acquired in AcquireLock.
+//
+// If deleting the lock key fails, the key stays on a lease this backend goes
+// on renewing, so every other replica would wait for it until this one next
+// takes the same name or exits. Unlock therefore keeps retrying in the
+// background until the delete succeeds or the session stops renewing (when
+// the lease, and the key with it, lapses within the TTL). The local mutex is
+// held until then: a re-acquisition of the name by this backend would reuse
+// the very same key, so a retry landing after it would delete a live lock.
+// In-process callers of that name wait for the retry, as they wait on the
+// local mutex anyway.
 type etcdUnlocker struct {
+	sess    *concurrency.Session
 	mu      *concurrency.Mutex
 	local   *sync.Mutex
 	timeout time.Duration
+	hook    func() error
 }
 
 func (u *etcdUnlocker) Unlock() error {
+	if err := u.release(); err != nil {
+		go u.retryRelease()
+		return err
+	}
+	u.local.Unlock()
+	return nil
+}
+
+// release makes one attempt to delete the lock key.
+func (u *etcdUnlocker) release() error {
+	if u.hook != nil {
+		if err := u.hook(); err != nil {
+			return err
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), u.timeout)
 	defer cancel()
-	err := u.mu.Unlock(ctx)
-	u.local.Unlock()
-	return err
+	return u.mu.Unlock(ctx)
+}
+
+// retryRelease retries release until it succeeds or the session lapses,
+// then frees the local mutex.
+func (u *etcdUnlocker) retryRelease() {
+	defer u.local.Unlock()
+	t := time.NewTicker(etcdUnlockRetryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-u.sess.Done():
+			return
+		case <-t.C:
+		}
+		if u.release() == nil {
+			return
+		}
+	}
 }
 
 // Close releases the underlying etcd client when owned by this backend,

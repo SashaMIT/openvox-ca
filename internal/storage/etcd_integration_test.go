@@ -22,6 +22,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -582,6 +583,18 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 		})
 	})
 
+	It("grants production leases with the documented TTL", func() {
+		b := newBackend(cli, prefix)
+		DeferCleanup(b.Close)
+		ul, err := b.AcquireLock(context.Background(), "crl")
+		Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+		DeferCleanup(ul.Unlock)
+
+		resp, err := cli.TimeToLive(context.Background(), currentSession(b).Lease())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resp.GrantedTTL).To(Equal(int64(30)))
+	})
+
 	Context("when the caller's context ends before a session exists", func() {
 		It("fails the lease grant and leaves no session behind", func() {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -590,6 +603,87 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 			_, err := a.AcquireLock(ctx, "crl")
 			Expect(err).To(MatchError(context.Canceled))
 			Expect(currentSession(a)).To(BeNil())
+		})
+	})
+
+	Context("when deleting the lock key fails", func() {
+		errInjected := errors.New("injected delete failure")
+		var (
+			failing atomic.Bool
+			ul      Unlocker
+		)
+
+		BeforeEach(func() {
+			// Long enough that the stranded key cannot lapse on its own
+			// within any window below.
+			a.lockTTL = 10
+			failing.Store(true)
+			a.unlockHook = func() error {
+				if failing.Load() {
+					return errInjected
+				}
+				return nil
+			}
+			// Deletes succeed again before the backend's own Close, so
+			// that cleanup does not depend on the retry giving up.
+			DeferCleanup(func() { failing.Store(false) })
+
+			var err error
+			ul, err = a.AcquireLock(context.Background(), "subject:stranded")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock")
+			Expect(ul.Unlock()).To(MatchError(errInjected))
+		})
+
+		// aAcquires has this backend try for the stranded name in a
+		// goroutine, since the process-local mutex ignores contexts.
+		aAcquires := func() chan error {
+			ch := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				ul, err := a.AcquireLock(ctx, "subject:stranded")
+				if err == nil {
+					err = ul.Unlock()
+				}
+				ch <- err
+			}()
+			return ch
+		}
+
+		It("goes on retrying, so other replicas need not wait for this one to take the name again", func() {
+			Expect(otherAcquires("subject:stranded", time.Second)).To(MatchError(context.DeadlineExceeded),
+				"the injected failure did not leave the key behind, so this spec proves nothing")
+
+			failing.Store(false)
+
+			// Far short of the 10s lease the key would otherwise sit on.
+			Expect(otherAcquires("subject:stranded", 3*time.Second)).To(Succeed())
+		})
+
+		It("keeps this backend from taking the name until the key is gone", func() {
+			ch := aAcquires()
+			Consistently(ch, time.Second).ShouldNot(Receive(),
+				"this backend re-took the name while the stranded key could still be deleted from under it")
+
+			failing.Store(false)
+
+			var err error
+			Eventually(ch).WithTimeout(5 * time.Second).Should(Receive(&err))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("stops retrying once the session lapses, which takes the key with it", func() {
+			sess := currentSession(a)
+			_, err := cli.Revoke(context.Background(), sess.Lease())
+			Expect(err).NotTo(HaveOccurred(), "Revoke")
+			Eventually(sess.Done()).WithTimeout(10 * time.Second).Should(BeClosed())
+
+			// Deletes still fail: only the session ending can free the
+			// process-local lock here.
+			Eventually(aAcquires()).WithTimeout(5*time.Second).Should(Receive(&err),
+				"the retry held this backend's process-local lock past the end of its session")
+			Expect(err).To(MatchError(errInjected),
+				"the fresh acquisition's own release should still hit the injected failure")
 		})
 	})
 
