@@ -1406,12 +1406,21 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 	})
 
 	Describe("rules", func() {
-		It("rejects setup-go with cache: true", func() {
-			Expect(verifyTagWorkflowsColdIn(map[string][]byte{
-				"release.yml": workflow(tagOn, warmGo),
-			})).To(MatchError(ContainSubstring(
-				`release.yml job "build" step 1 (actions/setup-go) sets ` + "`cache: true`")))
-		})
+		// Only the literal false is accepted. setup-go reads True as warm, and
+		// an expression can evaluate to true, so a check that refused only
+		// "true" would pass both; these entries are what pin the allowlist.
+		DescribeTable("rejects setup-go with any cache value but false",
+			func(value string) {
+				Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+					"release.yml": workflow(tagOn,
+						"      - uses: actions/setup-go@abc\n        with:\n          cache: "+value+"\n"),
+				})).To(MatchError(ContainSubstring(
+					`release.yml job "build" step 1 (actions/setup-go) sets ` + "`cache: " + value + "`")))
+			},
+			Entry("true", "true"),
+			Entry("True, which setup-go also reads as warm", "True"),
+			Entry("an expression", "${{ inputs.cache }}"),
+		)
 
 		// The case the guard exists for: setup-go defaults to warm, so the
 		// step that merely says nothing is the one that looks harmless.
@@ -1465,18 +1474,22 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 
 		// Two spellings of one input are one input to the runner, so a cold
 		// spelling beside a warm one must not read as cold.
-		DescribeTable("rejects an input set twice under different cases",
-			func(action, with, input string) {
-				Expect(verifyTagWorkflowsColdIn(map[string][]byte{
-					"release.yml": workflow(tagOn, coldGo+"      - uses: "+action+"@abc\n        with:\n"+with),
-				})).To(MatchError(ContainSubstring(
-					"step 2 (" + action + ") sets the " + input + " input more than once under different cases")))
-			},
-			Entry("on setup-go", "actions/setup-go",
-				"          cache: false\n          Cache: true\n", "cache"),
-			Entry("on docker/build-push-action", "docker/build-push-action",
-				"          push: true\n          PUSH: false\n", "push"),
-		)
+		It("rejects setup-go's cache input set twice under different cases", func() {
+			Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+				"release.yml": workflow(tagOn,
+					"      - uses: actions/setup-go@abc\n        with:\n          cache: false\n          Cache: true\n"),
+			})).To(MatchError(ContainSubstring(
+				"step 1 (actions/setup-go) sets `cache:` more than once under different cases")))
+		})
+
+		// The refusal is confined to the one value the guard reads: an
+		// unrelated input repeated is not this check's business.
+		It("ignores another setup-go input set twice under different cases", func() {
+			Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+				"release.yml": workflow(tagOn, "      - uses: actions/setup-go@abc\n        with:\n"+
+					"          cache: false\n          go-version: '1.25'\n          Go-Version: '1.26'\n"),
+			})).To(Succeed())
+		})
 
 		It("accepts docker/build-push-action with no cache inputs", func() {
 			Expect(verifyTagWorkflowsColdIn(map[string][]byte{

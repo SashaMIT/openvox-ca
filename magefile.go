@@ -1244,20 +1244,16 @@ func verifyColdTagStepsIn(name string, doc tagCacheWorkflowDoc) (int, error) {
 		for i, s := range doc.Jobs[job].Steps {
 			uses, _, _ := strings.Cut(s.Uses, "@")
 			where := fmt.Sprintf("%s job %q step %d (%s)", name, job, i+1, uses)
-			inputs, clash := foldInputs(s.With)
-			clashErr := func() {
-				if clash != "" {
-					errs = append(errs, fmt.Errorf("%s sets the %s input more than once under different "+
-						"cases, and the runner reads them as one input, so this check cannot tell which "+
-						"value the action sees; keep one, in lower case", where, clash))
-				}
-			}
+			inputs, repeated := foldInputs(s.With)
 			switch action := actionPath(s.Uses); {
 			case action == "actions/setup-go":
 				setupGoSteps++
-				clashErr()
 				cache, ok := inputs["cache"]
-				if !ok {
+				if repeated["cache"] {
+					errs = append(errs, fmt.Errorf("%s sets `cache:` more than once under different "+
+						"cases, and the runner reads them as one input, so this check cannot tell which "+
+						"value setup-go sees; keep a single `cache: false`", where))
+				} else if !ok {
 					errs = append(errs, fmt.Errorf("%s has no `cache:` input, and setup-go defaults it "+
 						"to true, so a tag build would restore a Go build cache that main can write; "+
 						"set `cache: false`", where))
@@ -1270,7 +1266,8 @@ func verifyColdTagStepsIn(name string, doc tagCacheWorkflowDoc) (int, error) {
 				errs = append(errs, fmt.Errorf("%s restores or saves a cache in a workflow that runs "+
 					"on a tag; a tag build must not link anything a job on main wrote", where))
 			case action == "docker/build-push-action":
-				clashErr()
+				// Presence alone is refused, so every spelling of these
+				// inputs is caught by the fold without reading a value.
 				for _, key := range []string{"cache-from", "cache-to"} {
 					if _, ok := inputs[key]; ok {
 						errs = append(errs, fmt.Errorf("%s sets %s in a workflow that runs on a tag; "+
@@ -1292,23 +1289,22 @@ func actionPath(uses string) string {
 }
 
 // foldInputs returns a step's `with:` keyed by lowercased input name, and the
-// first name (in sorted order) that appears more than once once case is
-// ignored, or "" if none does. The runner hands an action its inputs as
-// INPUT_<NAME> environment variables, upper-cased, so `Cache-From:` reaches
-// docker/build-push-action exactly as `cache-from:` would; and two spellings
-// of one name are one input, so `cache: false` beside `Cache: true` cannot be
-// read as cold.
-func foldInputs(with map[string]yaml.Node) (map[string]yaml.Node, string) {
+// lowercased names that appear more than once when case is ignored. The runner
+// hands an action its inputs as INPUT_<NAME> environment variables,
+// upper-cased, so `Cache-From:` reaches docker/build-push-action exactly as
+// `cache-from:` would; and two spellings of one name are one input, so
+// `cache: false` beside `Cache: true` cannot be read as cold.
+func foldInputs(with map[string]yaml.Node) (map[string]yaml.Node, map[string]bool) {
 	folded := make(map[string]yaml.Node, len(with))
-	clash := ""
-	for _, key := range slices.Sorted(maps.Keys(with)) {
+	repeated := map[string]bool{}
+	for key, value := range with {
 		lower := strings.ToLower(key)
-		if _, dup := folded[lower]; dup && clash == "" {
-			clash = lower
+		if _, dup := folded[lower]; dup {
+			repeated[lower] = true
 		}
-		folded[lower] = with[key]
+		folded[lower] = value
 	}
-	return folded, clash
+	return folded, repeated
 }
 
 // pushCanFireOnTag reports whether a workflow's `on:` includes a push trigger
