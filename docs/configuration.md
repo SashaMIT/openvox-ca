@@ -1427,8 +1427,9 @@ differently, all deliberately:
   its public key (see [certificate renewal](api.md#certificate-renewal)). So the
   gate has nothing to judge, and the setting does not apply in either direction:
   a certificate that already carries SANs stays renewable after it is turned
-  off, and a re-key asking for a new name gets the certificate's own names back
-  rather than a refusal, even with it on.
+  off, and a re-key asking for a new name is renewed without it — not refused
+  with the setting off, and not granted with it on. To add a name, clean the
+  certificate and sign a new request.
 - **`openvox-ca generate --dns`** mints offline from names an operator typed on
   the CA host, and is not filtered.
 - **`POST /generate/{subject}?dns=`** is the same minting path reached over HTTP,

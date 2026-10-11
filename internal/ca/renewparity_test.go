@@ -324,10 +324,17 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			Expect(store.SaveCSR(ctx, subject, renewalCSR(newKey()))).To(Succeed())
 			Expect(os.Chmod(store.CSRDir(), 0o555)).To(Succeed())
 			DeferCleanup(func() { _ = os.Chmod(store.CSRDir(), 0o755) })
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			DeferCleanup(func() { slog.SetDefault(orig) })
 
 			renewed := renew()
 			Expect(renewed.PublicKey).To(Equal(csrKey.Public()))
 			Expect(store.HasCSR(ctx, subject)).To(BeTrue(), "the fixture must really have made the removal fail")
+			// The twin of the spec below: it asserts this line's absence, so
+			// this one proves the line exists to be absent.
+			Expect(buf.String()).To(ContainSubstring("Could not delete pending CSR"))
 		})
 
 		It("logs nothing about a queued request when there is none", func() {
