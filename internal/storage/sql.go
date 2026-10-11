@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -237,8 +238,6 @@ func newSQLBackend(db *bun.DB, owned bool, timeout, migrationTimeout time.Durati
 }
 
 // openSQLDB opens the database/sql handle and matching bun dialect for cfg.
-// PostgreSQL and MySQL support is added in later changes; selecting them here
-// returns a clear error until then.
 func openSQLDB(cfg SQLConfig) (*sql.DB, schema.Dialect, error) {
 	switch cfg.Dialect {
 	case SQLitePure:
@@ -249,12 +248,13 @@ func openSQLDB(cfg SQLConfig) (*sql.DB, schema.Dialect, error) {
 		}
 		return sqldb, sqlitedialect.New(), nil
 	case SQLPostgres:
-		opts := []pgdriver.Option{pgdriver.WithDSN(cfg.DSN)}
+		connector := pgdriver.NewConnector(pgdriver.WithDSN(cfg.DSN))
 		if cfg.TLS != nil {
-			opts = append(opts, pgdriver.WithTLSConfig(cfg.TLS))
+			if err := applyPostgresTLS(connector.Config(), cfg.TLS); err != nil {
+				return nil, nil, err
+			}
 		}
-		sqldb := sql.OpenDB(pgdriver.NewConnector(opts...))
-		return sqldb, pgdialect.New(), nil
+		return sql.OpenDB(connector), pgdialect.New(), nil
 	case SQLMySQL:
 		mycfg, err := mysqldriver.ParseDSN(cfg.DSN)
 		if err != nil {
@@ -278,6 +278,41 @@ func openSQLDB(cfg SQLConfig) (*sql.DB, schema.Dialect, error) {
 	default:
 		return nil, nil, fmt.Errorf("unknown SQL dialect %q", cfg.Dialect)
 	}
+}
+
+// applyPostgresTLS installs the sql_tls_* configuration on a pgdriver config
+// already populated from the DSN, replacing whatever TLS settings the DSN's
+// sslmode produced: the files are the operator's explicit request to verify
+// the server, so a DSN's sslmode=require cannot quietly turn verification off.
+//
+// pgdriver hands its TLS config to crypto/tls unchanged, and crypto/tls will
+// not verify a certificate without a ServerName to check it against. The name
+// is the host pgdriver will actually dial, read back from its parsed config
+// rather than re-parsed from the DSN, so PGHOST and the DSN's host= parameter
+// are honoured exactly as the driver honours them. An IP address is a valid
+// ServerName: crypto/tls checks it against the certificate's IP SANs.
+//
+// Two shapes have no single name to verify, and are refused rather than
+// guessed at. PostgreSQL does not offer TLS on a Unix socket at all, and
+// pgdriver cannot dial a multi-host DSN.
+func applyPostgresTLS(conf *pgdriver.Config, base *tls.Config) error {
+	if conf.Network != "tcp" {
+		return fmt.Errorf("sql_tls_* files need a TCP connection to PostgreSQL; the DSN selects a %s socket, which PostgreSQL does not serve over TLS", conf.Network)
+	}
+	if strings.Contains(conf.Addr, ",") {
+		return fmt.Errorf("sql_tls_* files need a single PostgreSQL host to verify; %q names several, which the PostgreSQL driver does not support", conf.Addr)
+	}
+	host, _, err := net.SplitHostPort(conf.Addr)
+	if err == nil && host == "" {
+		err = errors.New("no host")
+	}
+	if err != nil {
+		return fmt.Errorf("cannot find the PostgreSQL host to verify in address %q: %w", conf.Addr, err)
+	}
+	tlsCfg := base.Clone()
+	tlsCfg.ServerName = host
+	conf.TLSConfig = tlsCfg
+	return nil
 }
 
 // sqliteDSNWithDefaults adds connection parameters that make SQLite behave well
