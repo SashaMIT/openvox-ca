@@ -22,6 +22,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -170,7 +171,8 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		It("reports BAO_SKIP_VERIFY on a warning line of its own", func() {
 			GinkgoT().Setenv("BAO_SKIP_VERIFY", "true")
 			build()
-			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=BAO_SKIP_VERIFY`))
+			// Anchored at the end: with no CA file there is nothing to override.
+			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=BAO_SKIP_VERIFY\n`))
 			Expect(buf.String()).NotTo(ContainSubstring("level=ERROR"),
 				"warning level, so it does not trip alerting keyed on errors")
 		})
@@ -178,7 +180,7 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		It("reports VAULT_SKIP_VERIFY under its own name", func() {
 			GinkgoT().Setenv("VAULT_SKIP_VERIFY", "true")
 			build()
-			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=VAULT_SKIP_VERIFY`))
+			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=VAULT_SKIP_VERIFY\n`))
 		})
 
 		// The configured CA file cannot turn verification back on: the SDK's
@@ -309,12 +311,38 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 	})
 
 	// The environment can supply a client certificate as files or as PEM
-	// bytes; both forms get every case.
+	// bytes; both forms get every case. As with the CA, each case also checks
+	// the certificate the built client actually presents, since the
+	// supersession is predicted from cfg alone.
 	Context("with a client certificate from the environment", func() {
-		var certVar, keyVar string
+		var (
+			certVar, keyVar string
+			envCertDER      []byte
+		)
+
+		// certDER reads back the DER of the certificate in a PEM file.
+		certDER := func(path string) []byte {
+			data, err := os.ReadFile(path)
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(data)
+			Expect(block).NotTo(BeNil())
+			return block.Bytes
+		}
+
+		// presented returns the DER of the certificate the built client would
+		// present to OpenBao.
+		presented := func(client *api.Client) []byte {
+			getCert := client.CloneConfig().TLSConfig().GetClientCertificate
+			Expect(getCert).NotTo(BeNil(), "the built client presents no client certificate")
+			cert, err := getCert(&tls.CertificateRequestInfo{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cert.Certificate).NotTo(BeEmpty())
+			return cert.Certificate[0]
+		}
 
 		setClientCert := func(bytesForm bool) {
 			certPath, keyPath := writeKeyPair()
+			envCertDER = certDER(certPath)
 			certVar, keyVar = "BAO_CLIENT_CERT", "BAO_CLIENT_KEY"
 			certValue, keyValue := certPath, keyPath
 			if bytesForm {
@@ -329,12 +357,13 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 			GinkgoT().Setenv(keyVar, keyValue)
 		}
 
-		DescribeTable("warns when openvox-ca configures no TLS files",
+		DescribeTable("warns, and presents that certificate, when openvox-ca configures no TLS files",
 			func(bytesForm bool) {
 				setClientCert(bytesForm)
-				build()
+				client := build()
 				Expect(buf.String()).To(MatchRegexp(warnLine(certVar)))
 				Expect(buf.String()).To(MatchRegexp(warnLine(keyVar)))
+				Expect(presented(client)).To(Equal(envCertDER))
 			},
 			Entry("as files", false),
 			Entry("as PEM bytes", true),
@@ -342,26 +371,28 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 
 		// ConfigureTLS replaces the client certificate only when it is given
 		// one, so a CA file alone leaves the environment's certificate in use.
-		DescribeTable("still warns when only openbao.tls_ca_file is set",
+		DescribeTable("still warns, and still presents it, when only openbao.tls_ca_file is set",
 			func(bytesForm bool) {
 				setClientCert(bytesForm)
 				cfg.TLSCAFile, _ = writeCA()
-				build()
+				client := build()
 				Expect(buf.String()).To(MatchRegexp(warnLine(certVar)))
 				Expect(buf.String()).To(MatchRegexp(warnLine(keyVar)))
+				Expect(presented(client)).To(Equal(envCertDER))
 			},
 			Entry("as files", false),
 			Entry("as PEM bytes", true),
 		)
 
-		DescribeTable("reports it as superseded when openbao.tls_cert_file and tls_key_file are set",
+		DescribeTable("reports it as superseded, and presents openvox-ca's instead, when openbao.tls_cert_file and tls_key_file are set",
 			func(bytesForm bool) {
 				setClientCert(bytesForm)
 				cfg.TLSCertFile, cfg.TLSKeyFile = writeKeyPair()
-				build()
+				client := build()
 				Expect(buf.String()).To(MatchRegexp(infoLine(certVar, "openbao.tls_cert_file")))
 				Expect(buf.String()).To(MatchRegexp(infoLine(keyVar, "openbao.tls_cert_file")))
 				Expect(buf.String()).NotTo(ContainSubstring("level=WARN"))
+				Expect(presented(client)).To(Equal(certDER(cfg.TLSCertFile)))
 			},
 			Entry("as files", false),
 			Entry("as PEM bytes", true),
@@ -425,15 +456,27 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring(site))
 			Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: " + variable))
-			Expect(err.Error()).To(ContainSubstring("value withheld"))
+			Expect(err.Error()).To(ContainSubstring(variable + ": parse of the URL failed (value withheld)"))
 			for _, part := range []string{"someuser", "ss-secret", "pa/", `":pa"`, "host.invalid"} {
 				Expect(err.Error()).NotTo(ContainSubstring(part))
 			}
 		},
 		Entry("BAO_PROXY_ADDR, read with the environment", "BAO_PROXY_ADDR", "building default OpenBao client config"),
 		Entry("BAO_HTTP_PROXY, read with the environment", "BAO_HTTP_PROXY", "building default OpenBao client config"),
+		Entry("VAULT_PROXY_ADDR, under its own name", "VAULT_PROXY_ADDR", "building default OpenBao client config"),
 		Entry("BAO_AGENT_ADDR, parsed by NewClient", "BAO_AGENT_ADDR", "creating OpenBao client"),
 	)
+
+	// BAO_PROXY_ADDR supersedes BAO_HTTP_PROXY, so when both are set the
+	// error must blame the one the SDK actually parsed.
+	It("names BAO_PROXY_ADDR, not BAO_HTTP_PROXY, when both are set and it is the malformed one", func() {
+		GinkgoT().Setenv("BAO_HTTP_PROXY", "http://proxy.invalid:3128")
+		GinkgoT().Setenv("BAO_PROXY_ADDR", "http://someuser:pa/ss-secret@host.invalid:3128")
+		_, err := newClient(cfg)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("BAO_PROXY_ADDR: parse of the URL failed"))
+		Expect(err.Error()).NotTo(ContainSubstring("BAO_HTTP_PROXY: parse"))
+	})
 
 	// The withholding is for values the environment supplied; a bad
 	// openbao.addr is the operator's own configuration and keeps its detail.
