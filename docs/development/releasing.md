@@ -533,7 +533,10 @@ rather than because anyone intends to fix them. (Two entries that stood here
 previously — unsigned artefacts, and tag builds restoring Go caches saved on
 `main` — are closed: the first with [signing and
 provenance](#verifying-a-release), the second by building the binaries and
-packaging the chart without restoring a Go cache.)
+packaging the chart without restoring a Go cache. `mage dev:check` keeps the
+second closed: it fails if a workflow a tag push can trigger has an
+`actions/setup-go` step without `cache: false`, an `actions/cache` step, or a
+BuildKit cache on `docker/build-push-action`.)
 
 | Gap | Impact |
 | --- | --- |
