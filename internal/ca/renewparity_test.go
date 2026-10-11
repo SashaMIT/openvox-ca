@@ -35,6 +35,7 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"os"
 	"slices"
 	"time"
 
@@ -264,6 +265,9 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			Expect(renewed.Subject.CommonName).To(Equal(subject))
 			Expect(renewed.Subject.Organization).To(Equal([]string{"Original Org"}))
 			Expect(renewed.Subject.OrganizationalUnit).To(Equal([]string{"Ops"}))
+			// The original's subject was encoded by crypto/x509, as every
+			// subject this CA issues is, so it must come back byte for byte.
+			Expect(renewed.RawSubject).To(Equal(original.RawSubject))
 		})
 
 		It("keeps the original Puppet extensions and takes none from the CSR", func() {
@@ -307,6 +311,36 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			Expect(store.SaveCSR(ctx, subject, renewalCSR(newKey()))).To(Succeed())
 			renew()
 			Expect(store.HasCSR(ctx, subject)).To(BeFalse())
+		})
+
+		It("renews even when it cannot remove a queued request", func() {
+			// The removal is best-effort, like retiring the predecessor: by
+			// the time it runs the replacement is stored, and failing the
+			// renewal then would leave the agent without the certificate it
+			// has just been issued.
+			if os.Geteuid() == 0 {
+				Skip("root ignores directory permissions")
+			}
+			Expect(store.SaveCSR(ctx, subject, renewalCSR(newKey()))).To(Succeed())
+			Expect(os.Chmod(store.CSRDir(), 0o555)).To(Succeed())
+			DeferCleanup(func() { _ = os.Chmod(store.CSRDir(), 0o755) })
+
+			renewed := renew()
+			Expect(renewed.PublicKey).To(Equal(csrKey.Public()))
+			Expect(store.HasCSR(ctx, subject)).To(BeTrue(), "the fixture must really have made the removal fail")
+		})
+
+		It("logs nothing about a queued request when there is none", func() {
+			// The ordinary re-key has nothing queued, and the absent request
+			// must not read as a failure to remove one.
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			DeferCleanup(func() { slog.SetDefault(orig) })
+
+			Expect(store.HasCSR(ctx, subject)).To(BeFalse())
+			renew()
+			Expect(buf.String()).NotTo(ContainSubstring("Could not delete pending CSR"))
 		})
 
 		It("stores no request when it refuses a re-key", func() {

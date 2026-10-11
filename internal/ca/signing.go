@@ -902,8 +902,8 @@ var renewalRefreshedExtensions = []asn1.ObjectIdentifier{
 // matches OpenVox Server's renew-certificate!, which "recreates all the
 // extensions in the original certificate".
 //
-// The subject and every extension come from original, verbatim and with their
-// criticality, except renewalRefreshedExtensions. That includes the subject
+// Every extension comes from original, verbatim and with its criticality,
+// except renewalRefreshedExtensions. That includes the subject
 // alternative names, the key usage and extended key usage, and every Puppet
 // OID — authorisation-arc ones such as pp_cli_auth included. Nothing in a
 // renewal CSR reaches the certificate except its public key, so a renewal
@@ -915,6 +915,13 @@ var renewalRefreshedExtensions = []asn1.ObjectIdentifier{
 // issueLeafLocked's defaults. A certificate lacking either one gets the
 // default, which only narrows it: an absent key usage or extended key usage
 // means unrestricted.
+//
+// The subject is original's as crypto/x509 parses it, re-encoded the way this
+// CA encodes every subject it issues. A certificate this CA issued therefore
+// renews with its subject byte for byte; one signed under an imported CA key by
+// earlier software keeps the attributes pkix.Name models (C, ST, L, O, OU, CN,
+// serialNumber and the like) and loses any other, such as DC or emailAddress --
+// the same loss keyprovider.go records for the CA's own request.
 //
 // SECURITY: carrying authorisation OIDs forward is safe only because both
 // callers have established, before reaching here, that this CA issued original
@@ -1441,13 +1448,13 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 			if err != nil {
 				return nil, err
 			}
-			// A request already queued for this subject is now stale: the
-			// subject holds the certificate just issued, and signing that
-			// request later would mint a second one for the same name.
-			// Removed once the replacement is stored, as signing a request
-			// removes it, and as this path did when it signed through
-			// signWithDuration. Best-effort, like that removal: a failure
-			// here must not undo the renewal.
+			// Remove a request already queued for this subject, as this path
+			// always has: it used to sign through signWithDuration, which
+			// removes the request it signs, and a re-key should leave nothing
+			// behind that signing later would turn into a second certificate
+			// for the name. AutoRenew has never
+			// done this and still does not -- see its godoc. Best-effort, as
+			// that removal was: a failure here must not undo the renewal.
 			if err := c.Storage.DeleteCSR(ctx, subject); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				slog.Warn("Could not delete pending CSR after renewal", "subject", subject, "error", err)
 			}
@@ -1520,6 +1527,11 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 // CA.SupersedeAfter sits between those two: the predecessor is still retired,
 // but after a delay rather than in this call. RevokeOnAutoRenew decides
 // whether; SupersedeAfter decides when.
+//
+// Unlike Renew, this leaves any request queued for the subject alone. That is
+// what it has always done and what OpenVox Server's renewal does; Renew's
+// removal carries forward what its old signing path did, rather than being a
+// rule this path has broken.
 //
 // The caller must NOT hold c.mu. Same cross-node guarantees as Sign.
 func (c *CA) AutoRenew(ctx context.Context, presentedCert *x509.Certificate) ([]byte, error) {
