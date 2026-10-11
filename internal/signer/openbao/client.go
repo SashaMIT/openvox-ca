@@ -210,9 +210,11 @@ func clientCertSet(cfg Config) string {
 
 // logEnvironment reports the SDK environment variables behind the client
 // newClient has just built: one warning for each in effect, one info line
-// for each that openvox-ca's configuration supersedes, and an error-level
-// line of its own when server certificate verification is off. It logs
-// variable names only — BAO_TOKEN and the key variables hold secrets.
+// for each that openvox-ca's configuration supersedes, and a warning of its
+// own, with its own message, when server certificate verification is off.
+// That one stays at warning level rather than error, so it does not trip
+// alerting keyed on errors. It logs variable names only — BAO_TOKEN and the
+// key variables hold secrets.
 //
 // Whether a variable is in effect follows the SDK's own reading: either the
 // resulting config (verification, SRV lookup, redirects) or api.ReadBaoVariable,
@@ -224,7 +226,7 @@ func logEnvironment(cfg Config, c *api.Config) {
 		if cfg.TLSCAFile != "" {
 			attrs = append(attrs, "overrides", "openbao.tls_ca_file")
 		}
-		slog.Error("OpenBao server certificate verification is OFF for the connection carrying the login and the signing token", attrs...)
+		slog.Warn("OpenBao server certificate verification is OFF for the connection carrying the login and the signing token", attrs...)
 	}
 
 	for _, v := range envVariables {

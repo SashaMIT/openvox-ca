@@ -280,9 +280,10 @@ At startup, when it builds the client, `openvox-ca` logs which of these
 variables are in effect, by name only, because `BAO_TOKEN` and the
 certificate variables can hold secrets:
 
-- an `ERROR` line when `BAO_SKIP_VERIFY` (or `VAULT_SKIP_VERIFY`) has turned
-  off server certificate verification, since the connection it affects
-  carries the login credentials and the token that signs as the CA;
+- a separate `WARN` line, beginning `OpenBao server certificate verification
+  is OFF`, when `BAO_SKIP_VERIFY` (or `VAULT_SKIP_VERIFY`) has turned off
+  server certificate verification, since the connection it affects carries
+  the login credentials and the token that signs as the CA;
 - a `WARN` line for each other variable in effect, saying what it changes and
   which `openbao` setting, if any, it overrides;
 - an `INFO` line for each variable that is set but superseded by `openvox-ca`'s

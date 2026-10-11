@@ -103,20 +103,23 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 			"a warning on every clean start is noise, and noise is how a real one stops being read")
 	})
 
+	// skipVerifyLine matches the start of the dedicated record, so a generic
+	// "taken from the environment" warning cannot satisfy these specs.
+	const skipVerifyLine = `level=WARN msg="OpenBao server certificate verification is OFF[^"]*" `
+
 	Context("when server certificate verification is switched off", func() {
-		It("reports BAO_SKIP_VERIFY at error level", func() {
+		It("reports BAO_SKIP_VERIFY on a warning line of its own", func() {
 			GinkgoT().Setenv("BAO_SKIP_VERIFY", "true")
 			build()
-			Expect(buf.String()).To(ContainSubstring("level=ERROR"))
-			Expect(buf.String()).To(ContainSubstring("verification is OFF"))
-			Expect(buf.String()).To(ContainSubstring("variable=BAO_SKIP_VERIFY"))
+			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=BAO_SKIP_VERIFY`))
+			Expect(buf.String()).NotTo(ContainSubstring("level=ERROR"),
+				"warning level, so it does not trip alerting keyed on errors")
 		})
 
 		It("reports VAULT_SKIP_VERIFY under its own name", func() {
 			GinkgoT().Setenv("VAULT_SKIP_VERIFY", "true")
 			build()
-			Expect(buf.String()).To(ContainSubstring("level=ERROR"))
-			Expect(buf.String()).To(ContainSubstring("variable=VAULT_SKIP_VERIFY"))
+			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=VAULT_SKIP_VERIFY`))
 		})
 
 		// The configured CA file cannot turn verification back on: the SDK's
@@ -125,8 +128,7 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 			cfg.TLSCAFile = writeCA()
 			GinkgoT().Setenv("BAO_SKIP_VERIFY", "1")
 			build()
-			Expect(buf.String()).To(ContainSubstring("level=ERROR"))
-			Expect(buf.String()).To(ContainSubstring("overrides=openbao.tls_ca_file"))
+			Expect(buf.String()).To(MatchRegexp(skipVerifyLine + `variable=BAO_SKIP_VERIFY overrides=openbao\.tls_ca_file`))
 		})
 	})
 
