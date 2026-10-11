@@ -253,8 +253,11 @@ func openSQLDB(cfg SQLConfig) (*sql.DB, schema.Dialect, error) {
 		if cfg.TLS != nil {
 			opts = append(opts, pgdriver.WithTLSConfig(cfg.TLS))
 		}
-		sqldb := sql.OpenDB(pgdriver.NewConnector(opts...))
-		return sqldb, pgdialect.New(), nil
+		connector, err := newPostgresConnector(opts...)
+		if err != nil {
+			return nil, nil, err
+		}
+		return sql.OpenDB(connector), pgdialect.New(), nil
 	case SQLMySQL:
 		mycfg, err := mysqldriver.ParseDSN(cfg.DSN)
 		if err != nil {
