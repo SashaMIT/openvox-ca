@@ -142,6 +142,11 @@ CA in `sslrootcert` and names the host in the DSN, so mount that CA alongside.
 [the PostgreSQL backend](storage-backends.md#postgresql-backend). Project only
 the CA certificate, as above, when the Secret also holds the CA's key.
 
+With CloudNativePG, a DSN pointing at the cluster's `<cluster>-rw` service
+already names a host its server certificate covers, so moving from `require` to
+`verify-full` needs only `sslrootcert` pointed at `ca.crt` from the operator's
+`<cluster>-ca` Secret.
+
 The CA is read once, when openvox-ca opens the database, and `SIGHUP` does not
 reopen it (see [reloading configuration](configuration.md#reloading-configuration)).
 Rotating the database's CA therefore needs a pod restart; the Reloader
