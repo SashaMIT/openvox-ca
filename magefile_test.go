@@ -1520,8 +1520,12 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 			Entry("push with no value", "on:\n  push:\n", true),
 			Entry("push filtered only by paths", "on:\n  push:\n    paths: [\"charts/**\"]\n", true),
 			Entry("push filtered by tags", "on:\n"+tagOn, true),
-			Entry("push filtered by tags-ignore", "on:\n  push:\n    tags-ignore: [\"v*\"]\n", true),
+			// Paired with branches, as the real workflows are: a tag filter
+			// alone would be selected by the no-branch-filter rule anyway,
+			// so these are the entries that pin the tag filters themselves.
 			Entry("push filtered by branches and tags", "on:\n"+branchOn+"    tags: [\"v*\"]\n", true),
+			Entry("push filtered by branches and tags-ignore",
+				"on:\n"+branchOn+"    tags-ignore: [\"v*\"]\n", true),
 			Entry("push filtered by branches only", "on:\n"+branchOn, false),
 			Entry("push filtered by branches-ignore only",
 				"on:\n  push:\n    branches-ignore: [\"main\"]\n", false),
