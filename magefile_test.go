@@ -1620,6 +1620,17 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 			})).To(MatchError(ContainSubstring(
 				"the tag-triggered workflows (release.yml) have no actions/setup-go step")))
 		})
+
+		// The floor counts across the set: a later workflow with no setup-go
+		// step must not reset the count an earlier one contributed. The real
+		// tree cannot pin this, since its last-sorting tag workflow uses
+		// setup-go.
+		It("counts setup-go steps across every tag-triggered workflow", func() {
+			Expect(verifyTagWorkflowsColdIn(map[string][]byte{
+				"a.yml": workflow(tagOn, coldGo),
+				"b.yml": workflow(tagOn, "      - run: make\n"),
+			})).To(Succeed())
+		})
 	})
 
 	Describe("readWorkflowSources", func() {

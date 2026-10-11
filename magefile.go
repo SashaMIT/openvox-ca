@@ -1168,9 +1168,10 @@ func readWorkflowSources(dir string) (map[string][]byte, error) {
 //
 // It has a floor: at least one tag-triggered workflow, and at least one
 // actions/setup-go step among them. Without one, a parsing regression that
-// selected nothing would pass -- and so would the day release.yml stopped
-// using setup-go, which is the point to re-read this guard rather than let it
-// go quiet.
+// selected nothing would pass. The setup-go half counts across the whole
+// set, so it fires only when no tag-triggered workflow uses setup-go at all:
+// it is not a per-workflow check, and release.yml alone moving to another
+// toolchain installer would leave it satisfied by helm-chart.yml.
 func verifyTagWorkflowsColdIn(sources map[string][]byte) error {
 	var errs []error
 	var tagged []string
@@ -1206,8 +1207,8 @@ func verifyTagWorkflowsColdIn(sources map[string][]byte) error {
 	}
 	if setupGoSteps == 0 {
 		return fmt.Errorf("the tag-triggered workflows (%s) have no actions/setup-go step, so the "+
-			"tag-build cache check checked no Go toolchain at all; if the release build really "+
-			"stopped using setup-go, revisit verifyTagWorkflowsCold rather than letting it go quiet",
+			"tag-build cache check checked no Go toolchain at all; if tag builds really stopped "+
+			"using setup-go, revisit verifyTagWorkflowsCold rather than letting it go quiet",
 			strings.Join(tagged, ", "))
 	}
 	return nil
