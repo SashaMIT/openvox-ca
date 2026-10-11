@@ -43,6 +43,13 @@ import (
 // startEmbeddedEtcd boots an in-process etcd server on an ephemeral port and
 // returns a client connected to it plus a teardown function.
 func startEmbeddedEtcd() (*clientv3.Client, func()) {
+	cli, _, cleanup := startEmbeddedEtcdServer()
+	return cli, cleanup
+}
+
+// startEmbeddedEtcdServer is startEmbeddedEtcd, plus a function that stops
+// only the server, so a spec can make etcd unreachable from a live client.
+func startEmbeddedEtcdServer() (*clientv3.Client, func(), func()) {
 	dir := GinkgoT().TempDir()
 
 	peerURL, err := url.Parse("http://127.0.0.1:0")
@@ -85,12 +92,14 @@ func startEmbeddedEtcd() (*clientv3.Client, func()) {
 		Expect(err).NotTo(HaveOccurred(), "etcd client: %v", err)
 	}
 
+	var stopOnce sync.Once
+	stopServer := func() { stopOnce.Do(e.Close) }
 	cleanup := func() {
 		cli.Close()
-		e.Close()
+		stopServer()
 		os.RemoveAll(dir)
 	}
-	return cli, cleanup
+	return cli, stopServer, cleanup
 }
 
 func newBackend(cli *clientv3.Client, prefix string) *EtcdBackend {
@@ -435,14 +444,15 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 	)
 
 	var (
-		cli   *clientv3.Client
-		a     *EtcdBackend
-		other *EtcdBackend
+		cli        *clientv3.Client
+		stopServer func()
+		a          *EtcdBackend
+		other      *EtcdBackend
 	)
 
 	BeforeEach(func() {
 		var stop func()
-		cli, stop = startEmbeddedEtcd()
+		cli, stopServer, stop = startEmbeddedEtcdServer()
 		DeferCleanup(stop)
 		a = newBackend(cli, prefix)
 		other = newBackend(cli, prefix)
@@ -549,6 +559,38 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 		It("gives up its place, so other replicas need not wait out the lease", func() {
 			Expect(otherAcquires("crl", time.Second)).To(Succeed())
 		})
+
+		It("lets this backend lock again, on a fresh session", func() {
+			// In a goroutine because the process-local mutex ignores
+			// contexts: if the refusal kept it, this would hang, not fail.
+			ch := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				ul, err := a.AcquireLock(ctx, "crl")
+				if err == nil {
+					err = ul.Unlock()
+				}
+				ch <- err
+			}()
+
+			var err error
+			Eventually(ch).WithTimeout(5*time.Second).Should(Receive(&err),
+				"the refused acquisition kept this backend's process-local lock on crl")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(currentSession(a).Done()).NotTo(BeClosed())
+		})
+	})
+
+	Context("when the caller's context ends before a session exists", func() {
+		It("fails the lease grant and leaves no session behind", func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, err := a.AcquireLock(ctx, "crl")
+			Expect(err).To(MatchError(context.Canceled))
+			Expect(currentSession(a)).To(BeNil())
+		})
 	})
 
 	Context("when the backend is closed", func() {
@@ -563,6 +605,20 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 			Expect(a.Close()).To(Succeed())
 
 			Expect(otherAcquires("crl", time.Second)).To(Succeed())
+		})
+
+		It("stops waiting to revoke at the request timeout when etcd cannot be reached", func() {
+			a.timeout = 500 * time.Millisecond
+			_, err := a.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+
+			stopServer()
+
+			done := make(chan error, 1)
+			go func() { done <- a.Close() }()
+			// Far short of the 10s TTL the revoke would otherwise wait out.
+			Eventually(done).WithTimeout(3*time.Second).Should(Receive(),
+				"Close waited on the unreachable server for the lease TTL")
 		})
 
 		It("refuses to start a new session", func() {

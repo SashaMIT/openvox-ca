@@ -475,8 +475,7 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 	select {
 	case <-sess.Done():
 		ul := &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}
-		_ = ul.Unlock()
-		return nil, fmt.Errorf("locking %q: %w", name, concurrency.ErrSessionExpired)
+		return nil, fmt.Errorf("locking %q: %w", name, errors.Join(concurrency.ErrSessionExpired, ul.Unlock()))
 	default:
 	}
 	return &etcdUnlocker{mu: mu, local: local, timeout: b.timeout}, nil
@@ -555,8 +554,12 @@ func (b *EtcdBackend) Close() error {
 	if b.session != nil {
 		// Before cancelling sessionCtx: Session.Close revokes the lease
 		// under it, and a cancelled one would leave every lock this
-		// backend holds to wait out the TTL instead.
+		// backend holds to wait out the TTL instead. The revoke waits for
+		// etcd for up to the TTL, though, so cut it off at the request
+		// timeout: a shutdown during an outage must not outlast the drain.
+		stop := time.AfterFunc(b.timeout, b.sessionCancel)
 		_ = b.session.Close()
+		stop.Stop()
 		b.session = nil
 	}
 	if b.sessionCancel != nil {

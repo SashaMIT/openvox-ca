@@ -190,7 +190,9 @@ The etcd lease belongs to the backend, not to a request. Every lock an
 `EtcdBackend` takes shares one lease-backed session, so the `AcquireLock` call
 that creates it is only its first user: the caller's context bounds the lease
 grant and nothing else, and the keepalive runs on a context that only `Close`
-cancels. Binding the session to the caller's context, which is what
+cancels. `Close` revokes the lease before cancelling it, so locks the backend
+still holds free at once, and gives up after the request timeout if etcd cannot
+be reached. Binding the session to the caller's context, which is what
 `concurrency.WithContext` does, stops the keepalive when that request returns,
 and every other lock on the session lapses one TTL later, part-way through its
 read-modify-write ([#442](https://github.com/voxpupuli/openvox-ca/issues/442)).
