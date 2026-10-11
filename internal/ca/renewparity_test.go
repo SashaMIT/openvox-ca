@@ -67,6 +67,9 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 	)
 
 	ppRole := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 34380, 1, 1, 13}
+	// An authorisation-arc extension the original does not hold, so a renewal
+	// CSR asking for it asks for authority the certificate was never given.
+	ppAuthRole := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 34380, 1, 3, 13}
 	// Under IANA's example enterprise number (RFC 5612), so it cannot collide
 	// with an extension anything here interprets.
 	oidKept := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}
@@ -136,6 +139,7 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			IPAddresses: []net.IP{net.ParseIP("10.9.9.9")},
 			ExtraExtensions: []pkix.Extension{
 				{Id: ppRole, Value: marshal("db")},
+				{Id: ppAuthRole, Value: marshal("admin")},
 				{Id: oidAsked, Value: marshal("asked")},
 			},
 		}, key)
@@ -269,11 +273,16 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 		})
 
 		It("keeps the original's authorisation extensions", func() {
-			// A CSR cannot ask for pp_cli_auth, but a certificate that holds it
-			// keeps it across a re-key exactly as across an auto-renewal.
+			// A certificate that holds pp_cli_auth keeps it across a re-key
+			// exactly as across an auto-renewal, whatever the CSR carries.
 			v, ok := extValue(renew(), ca.OIDPpCliAuth)
 			Expect(ok).To(BeTrue(), "a re-key must not strip pp_cli_auth from a certificate that holds it")
 			Expect(v).To(Equal(marshal("true")))
+		})
+
+		It("takes no authorisation extension from the CSR", func() {
+			_, ok := extValue(renew(), ppAuthRole)
+			Expect(ok).To(BeFalse(), "a re-key must not grant authority the original certificate does not hold")
 		})
 
 		It("keeps the original key usage and extended key usage", func() {
@@ -290,6 +299,14 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			Expect(v).To(Equal(marshal("kept")))
 			_, ok = extValue(renewed, oidAsked)
 			Expect(ok).To(BeFalse(), "an extension only the CSR asked for must not appear")
+		})
+
+		It("clears a request already queued for the subject", func() {
+			// Left queued, it would let a later sign mint a second certificate
+			// for a name that has just been renewed.
+			Expect(store.SaveCSR(ctx, subject, renewalCSR(newKey()))).To(Succeed())
+			renew()
+			Expect(store.HasCSR(ctx, subject)).To(BeFalse())
 		})
 
 		It("stores no request when it refuses a re-key", func() {

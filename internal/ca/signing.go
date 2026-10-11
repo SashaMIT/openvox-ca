@@ -653,8 +653,9 @@ func defaultLeafExtKeyUsage() []x509.ExtKeyUsage {
 }
 
 // issueLeafLocked builds, signs, and persists a leaf certificate for subject
-// from the given public key, SANs, extended key usages, and extra (Puppet OID)
-// extensions, then appends the inventory entry and updates the in-memory serial
+// from the given public key, SANs, extended key usages, and extra extensions
+// (Puppet OIDs from the signing path; every carried extension of the original
+// from reissueLeafLocked), then appends the inventory entry and updates the in-memory serial
 // index. ttl=0 means use the default certValidity. c.mu must be held by the
 // caller.
 //
@@ -1424,7 +1425,7 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 			// The certificate being renewed supplies the subject and every
 			// extension; the CSR supplies the key and nothing else. The CSR is
 			// not stored: it is not a request for anything the queue could
-			// later sign, and OpenVox Server's renewal touches no CSR either.
+			// later sign.
 			//
 			// SECURITY: copying presentedCert is only safe because it has been
 			// authenticated by the time it gets here — issued by us, not
@@ -1436,7 +1437,21 @@ func (c *CA) Renew(ctx context.Context, subject string, csrPEM []byte, presented
 			// carried onto a fresh certificate. Do not collapse the two checks
 			// into one on the grounds that they look redundant.
 			// NIST 800-53: IA-5(2) (PKI-Based Authentication), AC-3 (Access Enforcement)
-			return c.reissueLeafLocked(ctx, subject, presentedCert, csr.PublicKey)
+			certPEM, err := c.reissueLeafLocked(ctx, subject, presentedCert, csr.PublicKey)
+			if err != nil {
+				return nil, err
+			}
+			// A request already queued for this subject is now stale: the
+			// subject holds the certificate just issued, and signing that
+			// request later would mint a second one for the same name.
+			// Removed once the replacement is stored, as signing a request
+			// removes it, and as this path did when it signed through
+			// signWithDuration. Best-effort, like that removal: a failure
+			// here must not undo the renewal.
+			if err := c.Storage.DeleteCSR(ctx, subject); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("Could not delete pending CSR after renewal", "subject", subject, "error", err)
+			}
+			return certPEM, nil
 		}()
 		if err != nil {
 			return err
