@@ -1406,9 +1406,11 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 	})
 
 	Describe("rules", func() {
-		// Only the literal false is accepted. setup-go reads True as warm, and
-		// an expression can evaluate to true, so a check that refused only
-		// "true" would pass both; these entries are what pin the allowlist.
+		// Any value but the literal false is refused. setup-go reads True as
+		// warm, and an expression can evaluate to true, so a check that
+		// refused only "true" would pass both; these entries pin the refusal
+		// of warm values. That False is refused too is strictness, not
+		// safety -- setup-go reads it as cold -- so no entry pins it.
 		DescribeTable("rejects setup-go with any cache value but false",
 			func(value string) {
 				Expect(verifyTagWorkflowsColdIn(map[string][]byte{
@@ -1509,8 +1511,8 @@ var _ = Describe("verifyTagWorkflowsCold", func() {
 
 		// Within one workflow: the violations sit in the job that sorts last,
 		// behind a clean one, so a check that stopped at the first job or the
-		// first violation would miss them. Both real tag workflows keep their
-		// setup-go step in the job that sorts first, so nothing else pins this.
+		// first violation would miss them. Every real setup-go step on a tag
+		// sits in its workflow's first-sorting job, so nothing else pins this.
 		It("reports every violation in every job of one workflow", func() {
 			err := verifyTagWorkflowsColdIn(map[string][]byte{
 				"release.yml": []byte("on:\n" + tagOn + "jobs:\n" +
