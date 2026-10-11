@@ -517,10 +517,23 @@ func applyCAConfig(myCA *ca.CA, cfg *serverConfig) error {
 	myCA.RevokeOnAutoRenew = cfg.RevokeOnAutoRenew
 	myCA.SupersedeAfter = cfg.supersededCertRevokeAfter()
 	myCA.SigningConcurrency = resolveSigningConcurrency(cfg.CASigningConcurrency)
-	myCA.KeyPassphrase = ca.KeyPassphraseConfig{
+	myCA.KeyPassphrase = keyPassphraseConfig(cfg)
+	return nil
+}
+
+// keyPassphraseConfig builds the passphrase sources for a CA from the server's
+// configuration.
+//
+// One function with two callers, and the second is the reason it exists: the
+// pre-fork preflight has to ask whether the passphrase resolves, and it has to
+// ask with exactly the sources Init will use. Built separately in both places,
+// the guard could pass on sources the CA then does not consult, or refuse on
+// ones it would have found -- a guard that mirrors the thing it guards instead
+// of sharing with it is a guard that can disagree with it.
+func keyPassphraseConfig(cfg *serverConfig) ca.KeyPassphraseConfig {
+	return ca.KeyPassphraseConfig{
 		PassphraseFile: cfg.CAKeyPassphraseFile,
 	}
-	return nil
 }
 
 // isLoopback reports whether host is a loopback address (127.x.x.x, ::1, or
@@ -852,7 +865,7 @@ func newRootCmd() *cobra.Command {
 				}
 				// Same reasoning for key-material permissions: a refusal raised
 				// past the fork is discarded with the child's stderr.
-				daemonWarnings, err := preflightKeyPermissions(ctx, cfg)
+				daemonWarnings, err := preflightKeyMaterial(ctx, cfg)
 				if err != nil {
 					return err
 				}
@@ -945,7 +958,7 @@ func newRootCmd() *cobra.Command {
 			// that holds the key; inheriting the parent's verdict across an
 			// execve is not something a child can do, so each checks for itself.
 			// NIST 800-53: SC-12 (Cryptographic Key Establishment and Management)
-			keyPermWarnings, err := preflightKeyPermissions(ctx, cfg)
+			keyPermWarnings, err := preflightKeyMaterial(ctx, cfg)
 			if err != nil {
 				return err
 			}
