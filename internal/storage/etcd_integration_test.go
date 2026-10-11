@@ -650,16 +650,37 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 		})
 	})
 
-	It("grants production leases with the documented TTL", func() {
-		b := newBackend(cli, prefix)
-		DeferCleanup(b.Close)
-		ul, err := b.AcquireLock(context.Background(), "crl")
-		Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
-		DeferCleanup(ul.Unlock)
+	// Built through NewEtcdBackend, the constructor production uses, rather
+	// than the shared-client one every other spec here goes through.
+	Context("when built as production builds it", func() {
+		var b *EtcdBackend
 
-		resp, err := cli.TimeToLive(context.Background(), currentSession(b).Lease())
-		Expect(err).NotTo(HaveOccurred())
-		Expect(resp.GrantedTTL).To(Equal(int64(30)))
+		BeforeEach(func() {
+			var err error
+			b, err = NewEtcdBackend(EtcdConfig{Endpoints: cli.Endpoints(), KeyPrefix: prefix})
+			Expect(err).NotTo(HaveOccurred(), "NewEtcdBackend")
+			// Close is asserted below; this only guards an early failure.
+			DeferCleanup(func() { _ = b.Close() })
+		})
+
+		It("grants leases with the documented TTL", func() {
+			ul, err := b.AcquireLock(context.Background(), "crl")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock crl")
+			DeferCleanup(ul.Unlock)
+
+			resp, err := cli.TimeToLive(context.Background(), currentSession(b).Lease())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.GrantedTTL).To(Equal(int64(30)))
+		})
+
+		It("closes the client it owns", func() {
+			Expect(b.Close()).To(Succeed())
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := b.client.Get(ctx, prefix+"/probe")
+			Expect(err).To(HaveOccurred(), "the backend's own client still answered after Close")
+		})
 	})
 
 	Context("when the caller's context ends before a session exists", func() {
