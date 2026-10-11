@@ -1325,10 +1325,9 @@ func pushCanFireOnTag(on yaml.Node) (bool, error) {
 			if on.Content[i].Value != "push" {
 				continue
 			}
+			// `push:` with no value decodes to an empty filter, which the
+			// last line reads as unfiltered, so it needs no case of its own.
 			push := on.Content[i+1]
-			if push.Tag == "!!null" {
-				return true, nil
-			}
 			var filter struct {
 				Branches       []string `yaml:"branches"`
 				BranchesIgnore []string `yaml:"branches-ignore"`
