@@ -369,6 +369,11 @@ Kubernetes wiring *and* set the config keys pointing at it, deep-merged with
 `config` winning. Adding a server setting to `docs/configuration.md` therefore
 needs no chart change; adding a value that duplicates one is a regression.
 
+The one exception is a setting that can hold a credential inline. `config`
+lands in a ConfigMap, so `openvox-ca.validate` refuses every such key it lists
+in `$credentials`; a new one needs adding there, with a reject case in
+`chart:test`, or the chart renders it in clear text without a word.
+
 Every fixture under `charts/openvox-ca/ci/` is linted and schema-checked in CI.
 A new template branch needs a fixture that exercises it, or it is untested —
 and schema validity is not correctness, so anything a reader has to *trust*
