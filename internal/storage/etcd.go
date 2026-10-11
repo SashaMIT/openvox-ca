@@ -94,12 +94,9 @@ type EtcdBackend struct {
 	importBatchHook  func()
 	mutateRecordHook func()
 	// unlockHook, when non-nil, runs before each attempt to delete a lock
-	// key; an error from it stands in for a failed delete. lockHook, when
-	// non-nil, runs once the mutex is won; an error from it stands in for
-	// a Lock that failed with its key already on the server. Test seams
-	// only: they drive the cleanup paths without an etcd outage.
+	// key; an error from it stands in for a failed delete. Test seam only:
+	// it drives the release-retry path without an etcd outage.
 	unlockHook func() error
-	lockHook   func() error
 
 	// session is the lease-backed concurrency session used for distributed
 	// mutexes. It is created lazily on the first AcquireLock call and
@@ -471,7 +468,7 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 		return nil, err
 	}
 	mu := concurrency.NewMutex(sess, b.prefix+"/locks/"+name)
-	if err := b.lockMutex(ctx, mu); err != nil {
+	if err := mu.Lock(ctx); err != nil {
 		// Lock can fail with this session's key still on the server: a
 		// commit whose answer is lost to the caller's deadline leaves the
 		// key with no revision Mutex.Unlock will act on, and Lock's own
@@ -498,17 +495,6 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 	default:
 	}
 	return b.newUnlocker(sess, mu.Key(), mu.Unlock, local), nil
-}
-
-// lockMutex takes mu, then runs lockHook.
-func (b *EtcdBackend) lockMutex(ctx context.Context, mu *concurrency.Mutex) error {
-	if err := mu.Lock(ctx); err != nil {
-		return err
-	}
-	if b.lockHook != nil {
-		return b.lockHook()
-	}
-	return nil
 }
 
 // newUnlocker returns an unlocker that releases key by calling del, and then
@@ -568,7 +554,8 @@ func (b *EtcdBackend) ensureSession(ctx context.Context) (*concurrency.Session, 
 // trying to delete the key again.
 const etcdUnlockRetryInterval = 500 * time.Millisecond
 
-// etcdUnlocker wraps concurrency.Mutex (the distributed lock) plus the
+// etcdUnlocker deletes one distributed lock key, through del (the mutex's
+// Unlock, or a direct delete when Lock failed), then releases the
 // process-local mutex acquired in AcquireLock.
 //
 // If deleting the lock key fails, the key stays on a lease this backend goes

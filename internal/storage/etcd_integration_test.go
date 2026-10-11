@@ -613,21 +613,25 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 	})
 
 	Context("when an acquisition fails with its key already on the server", func() {
-		BeforeEach(func() {
+		It("deletes the key, so other replicas need not wait for this one to take the name again", func() {
 			// Long enough that the key could not lapse on its own within
 			// the window below.
 			a.lockTTL = 10
-			var once sync.Once
-			a.lockHook = func() error {
-				var err error
-				once.Do(func() { err = errInjected })
-				return err
-			}
-		})
+			_, err := a.AcquireLock(context.Background(), "subject:other")
+			Expect(err).NotTo(HaveOccurred(), "AcquireLock to create the session")
 
-		It("deletes the key, so other replicas need not wait for this one to take the name again", func() {
-			_, err := a.AcquireLock(context.Background(), "subject:abandoned")
-			Expect(err).To(MatchError(errInjected))
+			// The state a commit whose answer was lost leaves behind: the
+			// waiter key, written by the library itself on this backend's
+			// lease, and a Mutex with no revision for Unlock to act on.
+			planted := concurrency.NewMutex(currentSession(a), prefix+"/locks/subject:abandoned")
+			Expect(planted.Lock(context.Background())).To(Succeed(), "plant the waiter key")
+
+			// A cancelled context fails tryAcquire's Txn before it sets a
+			// revision, just as a lost answer does.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err = a.AcquireLock(ctx, "subject:abandoned")
+			Expect(err).To(MatchError(context.Canceled))
 
 			Expect(otherAcquires("subject:abandoned", time.Second)).To(Succeed())
 		})

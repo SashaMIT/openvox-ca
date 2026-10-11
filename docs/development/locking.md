@@ -188,41 +188,24 @@ server-side keepalives for HA deployments.
 
 The etcd lease belongs to the backend, not to a request. Every lock an
 `EtcdBackend` takes shares one lease-backed session, so the `AcquireLock` call
-that creates it is only its first user: the caller's context bounds the lease
-grant and nothing else, and the keepalive runs on a context that only `Close`
-cancels. `Close` revokes the lease before cancelling it, so locks the backend
-still holds free at once, and gives up after the request timeout if etcd cannot
-be reached. That wait comes after the HTTP drain, so during an outage it can
-outlast the launcher's shutdown headroom; the lease then lapses on its TTL.
-Passing the caller's context to `concurrency.WithContext`, as the
-session once did, stops the keepalive when that request returns, and every
-other lock on the session lapses one TTL later, part-way through its
-read-modify-write ([#442](https://github.com/voxpupuli/openvox-ca/issues/442)).
-For the same reason `AcquireLock` refuses a lock with
-`concurrency.ErrSessionExpired` if the session has stopped renewing by the time
-the mutex is won. The waiter's key survives on the server until the TTL runs
-out, so `Mutex.Lock` would otherwise grant a lock that another replica can take
-within seconds. Neither check covers a lease lost *after* the lock is granted;
+that creates it is only its first user, and its context must bound the lease
+grant and nothing else. Passing it to `concurrency.WithContext`, as the session
+once did, stops the keepalive when that request returns, and every other lock
+on the session lapses one TTL later, part-way through its read-modify-write
+([#442](https://github.com/voxpupuli/openvox-ca/issues/442)).
+
+Two rules follow from a lease that outlives requests, and
+[storage internals](storage-internals.md#cross-node-coordination) describes the
+mechanism behind both. A lock is refused if the session has stopped renewing by
+the time it is won, because its key would lapse within the TTL with the caller
+mid-way through its critical section. And a lock key the backend fails to
+delete no longer lapses on its own, so the backend retries the delete until it
+succeeds or the session lapses, holding the per-name process-local mutex
+throughout. That second rule has a cost at this layer: in-process callers of
+that name wait out an etcd stall, and like every wait on that mutex they ignore
+their contexts. Neither rule covers a lease lost *after* the lock is granted;
 rule 6 of [Rules for new or changed code](#rules-for-new-or-changed-code)
 covers that.
-
-A lease that outlives requests also means a lock key no longer lapses on its
-own when the backend fails to delete it. If a release fails (an etcd stall
-longer than the request timeout, say) the key stays on a lease the backend goes
-on renewing, and every other replica would wait for it until this one next took
-the same name. A failed *acquisition* can leave the same thing behind: a
-commit whose answer is lost to the caller's deadline puts the waiter key on the
-server without giving `Mutex.Unlock` a revision to act on, so `AcquireLock`
-deletes this session's key itself whenever `Lock` fails. Both go through
-`etcdUnlocker`, which retries the delete in the background until it succeeds
-or the session stops renewing, which lets the lease and the key lapse within
-the TTL. A put still in flight when that delete lands can strand the key
-regardless; that needs a lost commit and a stall together, and it ends when
-this replica next takes the name. It holds the per-name process-local mutex until then, because a
-re-acquisition by the same backend reuses the very same key, and a retry
-landing after it would delete a live lock. In-process callers of that name
-therefore wait out the stall, and like every wait on that mutex they ignore
-their contexts.
 
 Every implementation of either capability first takes a **per-name
 process-local mutex** before touching the network or the filesystem. This is
