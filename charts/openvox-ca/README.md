@@ -46,7 +46,10 @@ mirror it key by key. Instead:
   through `listen.port`, `persistence.mountPath` and `metrics.port`, or set both
   sides to agree.
 - **`env`, `extraEnv` and `envFrom`** are the escape hatch for settings that
-  must come from a Secret at runtime, such as a database DSN.
+  must come from a Secret at runtime, such as a database DSN. A DSN can instead
+  stay out of the environment altogether: mount its Secret through
+  `extraVolumes` and `extraVolumeMounts` and point `config.sql_dsn_file` at the
+  file (see [the guide](https://github.com/voxpupuli/openvox-ca/blob/main/docs/helm-chart.md)).
 
 A single `helm template` will show you exactly what the merge produced.
 

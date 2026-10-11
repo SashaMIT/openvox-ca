@@ -108,8 +108,8 @@ and the matching `tls_key`. If you would rather point them somewhere else, set
 Run `helm template` to see exactly what the merge produced — the rendered
 `config.yaml` is right there in the ConfigMap.
 
-Settings that must come from a Secret at runtime, such as a database DSN, go
-through the environment instead:
+Settings that must come from a Secret at runtime, such as a database DSN, can
+go through the environment instead:
 
 ```yaml
 extraEnv:
@@ -124,6 +124,27 @@ extraEnv:
 
 Environment variables take precedence over the config file, which is what makes
 this work.
+
+If the Secret already holds the whole DSN, mount it as a file and point
+`sql_dsn_file` at it instead. That keeps the password out of the environment as
+well; see [keeping the database password private](storage-backends.md#keeping-the-database-password-private).
+
+```yaml
+config:
+  sql_dsn_file: /run/secrets/openvox-ca-db/dsn
+extraVolumes:
+  - name: db-dsn
+    secret:
+      secretName: openvox-ca-db
+      defaultMode: 0600
+      items:
+        - key: uri
+          path: dsn
+extraVolumeMounts:
+  - name: db-dsn
+    mountPath: /run/secrets/openvox-ca-db
+    readOnly: true
+```
 
 ## Choosing an image
 
