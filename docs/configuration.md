@@ -111,7 +111,7 @@ ca_subject_province: ""
 ca_path_length: -1    # -1 = unconstrained, 0 = leaf certs only, N = N levels of intermediates
 ca_validity_days: 0   # 0 = built-in default (~5 years); positive integer overrides
 leaf_validity_days: 0 # 0 = built-in default (~5 years); positive integer overrides
-promote_cn_to_san: true # add the CN as a DNS SAN when a CSR carries none (RFC 2818)
+promote_cn_to_san: true # add the CN as a DNS SAN when a CSR carries none (RFC 2818); first issuance only
 allow_subject_alt_names: false # let a CSR request SANs of its own; see "Subject alternative names requested by a CSR"
 crl_validity_days: 0  # 0 = built-in default (30 days); positive integer overrides
 csr_rate_limit: 60    # max CSR submissions per IP per minute; 0 = disable rate limiting
@@ -1387,7 +1387,10 @@ refused at signing time.
 A CSR whose only SAN is a DNS entry equal to its own certname is always allowed,
 whatever the setting: agents send that to comply with RFC 2818, and it asks for
 nothing the certname does not already grant. That is distinct from
-`promote_cn_to_san`, which *adds* that entry when a CSR carries none.
+`promote_cn_to_san`, which *adds* that entry when a CSR carries none. That
+applies on first issuance only: a [renewal](api.md#certificate-renewal), re-key
+included, keeps the SANs its certificate already has, so a certificate issued
+without one gains it only by being cleaned and signed again.
 
 Turn it on when nodes legitimately need extra names — a load-balanced service
 answering to several hostnames, say — and prefer a narrow autosign policy

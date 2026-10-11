@@ -236,7 +236,7 @@ Either way the new certificate recreates the presented one, as OpenVox Server's 
 - CRL distribution points and authority information access, taken from the CA's current `crl_url` and `ocsp_url` (see [configuration](configuration.md)), so a renewed certificate points wherever the CA publishes today;
 - basic constraints, which mark every certificate this CA renews as a leaf.
 
-A presented certificate carrying no key usage or no extended key usage at all is unrestricted in that respect. It receives the CA's default (`digitalSignature`, `keyEncipherment`; `serverAuth`, `clientAuth`) rather than staying unrestricted — the only respect in which a renewal differs from its original, and one that can only narrow it.
+A presented certificate carrying no key usage or no extended key usage at all is unrestricted in that respect. It receives the CA's default (`digitalSignature`, `keyEncipherment`; `serverAuth`, `clientAuth`) rather than staying unrestricted. Beyond the extensions listed above, that is the only respect in which a renewal differs from its original, and it can only narrow it.
 
 OpenVox Server's renewal takes no CSR at all, so the re-key form is openvox-ca's own addition. To change a certificate's names or extensions, clean it and sign a new request instead.
 
@@ -244,7 +244,7 @@ If the CA has not finished initialising, the request returns `503 Service Unavai
 
 If the presented certificate's (or CSR's) key falls below the CA key-strength policy — for example an RSA-1024 key imported from a legacy CA — the request is rejected with `422 Unprocessable Entity` rather than renewed; the agent must re-key via the CSR path with a compliant key.
 
-[`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr) does not apply to renewal, whatever its value. It governs the names a CSR may ask for on a first issuance; a renewal takes no names from its CSR, so a re-key requesting a SAN the presented certificate lacks is renewed without it rather than refused.
+[`allow_subject_alt_names`](configuration.md#subject-alternative-names-requested-by-a-csr) does not apply to renewal, whatever its value. It governs the names a CSR may ask for on a first issuance; a renewal takes no names from its CSR, so a re-key requesting a SAN the presented certificate lacks is renewed without it rather than refused. Nor does [`promote_cn_to_san`](configuration.md): a certificate issued without a SAN is renewed without one, as OpenVox Server renews it, so clean and re-sign it to add one.
 
 If the presented certificate has been revoked, both paths reject the request with `403 Forbidden`. That check re-reads the CRL from storage rather than trusting the in-memory copy the mTLS layer uses, so it holds even on a replica that has not yet picked up a revocation performed elsewhere — renewal does not become a way out of a lockout during the propagation window.
 

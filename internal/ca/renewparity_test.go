@@ -59,10 +59,11 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 	const subject = "renew-parity"
 
 	var (
-		ctx      context.Context
-		myCA     *ca.CA
-		store    *storage.StorageService
-		original *x509.Certificate
+		ctx         context.Context
+		myCA        *ca.CA
+		store       *storage.StorageService
+		original    *x509.Certificate
+		originalKey *ecdsa.PrivateKey
 	)
 
 	ppRole := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 34380, 1, 1, 13}
@@ -161,7 +162,7 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 		Expect(err).NotTo(HaveOccurred())
 		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 		Expect(err).NotTo(HaveOccurred())
-		key := newKey()
+		originalKey = newKey()
 		der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
 			SerialNumber: serial,
 			Subject: pkix.Name{
@@ -193,7 +194,7 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 				{Id: ca.OIDPpCliAuth, Value: marshal("true")},
 				{Id: oidKept, Value: marshal("kept")},
 			},
-		}, myCA.CACert, &key.PublicKey, myCA.CAKey)
+		}, myCA.CACert, &originalKey.PublicKey, myCA.CAKey)
 		Expect(err).NotTo(HaveOccurred())
 		original, err = x509.ParseCertificate(der)
 		Expect(err).NotTo(HaveOccurred())
@@ -423,6 +424,55 @@ var _ = Describe("Renewal keeps the certificate it renews", func() {
 			},
 			Entry("on a re-key", func() ([]byte, error) { return myCA.Renew(ctx, subject, renewalCSR(newKey()), original) }, "re-key"),
 			Entry("on auto-renewal", func() ([]byte, error) { return myCA.AutoRenew(ctx, original) }, "same key"),
+			// The attribute follows the key, not the entry point: a renewal CSR
+			// over the certificate's own key moves the grant nowhere.
+			Entry("on a renewal CSR over the original's own key", func() ([]byte, error) {
+				return myCA.Renew(ctx, subject, renewalCSR(originalKey), original)
+			}, "same key"),
+		)
+	})
+
+	Context("when the original carries no subject alternative name", func() {
+		// promote_cn_to_san adds the Common Name as a DNS SAN on first issuance.
+		// A renewal keeps the SAN set the certificate has, as OpenVox Server's
+		// does, so a certificate issued without one is renewed without one,
+		// even from a CSR that carries none, which is the case promotion
+		// would act on at signing.
+		var nameless *x509.Certificate
+
+		BeforeEach(func() {
+			myCA.PromoteCNToSAN = true
+			serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+			Expect(err).NotTo(HaveOccurred())
+			key := newKey()
+			der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+				SerialNumber: serial,
+				Subject:      pkix.Name{CommonName: subject},
+				NotBefore:    time.Now().Add(-time.Hour),
+				NotAfter:     time.Now().Add(24 * time.Hour),
+			}, myCA.CACert, &key.PublicKey, myCA.CAKey)
+			Expect(err).NotTo(HaveOccurred())
+			nameless, err = x509.ParseCertificate(der)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(nameless.DNSNames).To(BeEmpty())
+		})
+
+		bareCSR := func() []byte {
+			GinkgoHelper()
+			der, err := x509.CreateCertificateRequest(rand.Reader,
+				&x509.CertificateRequest{Subject: pkix.Name{CommonName: subject}}, newKey())
+			Expect(err).NotTo(HaveOccurred())
+			return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+		}
+
+		DescribeTable("renews it without promoting the Common Name, whatever promote_cn_to_san says",
+			func(renew func() ([]byte, error)) {
+				certPEM, err := renew()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(parse(certPEM).DNSNames).To(BeEmpty())
+			},
+			Entry("on auto-renewal", func() ([]byte, error) { return myCA.AutoRenew(ctx, nameless) }),
+			Entry("on a re-key", func() ([]byte, error) { return myCA.Renew(ctx, subject, bareCSR(), nameless) }),
 		)
 	})
 })
