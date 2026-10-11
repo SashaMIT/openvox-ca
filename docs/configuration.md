@@ -1406,8 +1406,6 @@ differently, all deliberately:
                       instance lock, which records its holder) — see below
   private/
     ca_key.pem              CA private key (mode 0600; encrypted PEM when --encrypt-ca-key)
-    .ca_key_passphrase      Passphrase file written by versions that generated one
-                            (mode 0600). Not created any more — see ca-key-security.md
     {subject}_key.pem       Server-side generated private keys (mode 0600)
 ```
 
