@@ -923,7 +923,7 @@ var renewalRefreshedExtensions = []asn1.ObjectIdentifier{
 // serialNumber and the like) and loses any other, such as DC or emailAddress --
 // the same loss keyprovider.go records for the CA's own request.
 //
-// SECURITY: carrying authorisation OIDs forward is safe only because both
+// Carrying authorisation OIDs forward is safe only because both
 // callers have established, before reaching here, that this CA issued original
 // (assertOwnCertificate), that it is not revoked (refuseIfRevoked) and that it
 // is subject's. Without the first, any CA trusted for client authentication
@@ -944,7 +944,7 @@ func (c *CA) reissueLeafLocked(ctx context.Context, subject string, original *x5
 		return nil, err
 	}
 
-	// SECURITY: record every authorisation grant this renewal carried, with
+	// Record every authorisation grant this renewal carried, with
 	// the line GenerateWithOptions writes for a fresh one, so an operator
 	// alerting on it sees an administrator credential renewed as well as one
 	// minted. It matters most on a re-key, which puts the grant on a key this
