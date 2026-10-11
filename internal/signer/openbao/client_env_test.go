@@ -427,6 +427,24 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		Entry("BAO_DISABLE_REDIRECTS=false stays quiet", "BAO_DISABLE_REDIRECTS", "false", false),
 	)
 
+	// The variables with no openvox-ca equivalent each warn on their own;
+	// the troubleshooting entry in docs/openbao-transit.md sends operators
+	// looking for these lines.
+	DescribeTable("a variable with no openvox-ca equivalent warns",
+		func(name, value string) {
+			GinkgoT().Setenv(name, value)
+			build()
+			Expect(buf.String()).To(MatchRegexp(warnLine(name)))
+		},
+		Entry(nil, "BAO_TLS_SERVER_NAME", "openbao.example"),
+		Entry(nil, "BAO_HTTP_PROXY", "http://proxy.invalid:3128"),
+		Entry(nil, "BAO_MAX_RETRIES", "5"),
+		Entry(nil, "BAO_RATE_LIMIT", "10"),
+		Entry(nil, "BAO_NAMESPACE", "team-a"),
+		Entry(nil, "VAULT_NAMESPACE", "team-a"),
+		Entry(nil, "BAO_WRAP_TTL", "5m"),
+	)
+
 	It("ignores a variable set to the empty string, as the SDK does", func() {
 		GinkgoT().Setenv("BAO_NAMESPACE", "")
 		GinkgoT().Setenv("VAULT_NAMESPACE", "team-a")
@@ -476,6 +494,16 @@ var _ = Describe("newClient's report of the OpenBao environment", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("BAO_PROXY_ADDR: parse of the URL failed"))
 		Expect(err.Error()).NotTo(ContainSubstring("BAO_HTTP_PROXY: parse"))
+		Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: BAO_HTTP_PROXY, BAO_PROXY_ADDR)"))
+	})
+
+	// The SDK's message names BAO_SKIP_VERIFY whichever spelling was set,
+	// so the suffix is what points at the variable actually in use.
+	It("names VAULT_SKIP_VERIFY when an unparsable value stops the client being built", func() {
+		GinkgoT().Setenv("VAULT_SKIP_VERIFY", "maybe")
+		_, err := newClient(cfg)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("OpenBao environment variables set: VAULT_SKIP_VERIFY)"))
 	})
 
 	// The withholding is for values the environment supplied; a bad
