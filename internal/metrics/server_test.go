@@ -67,6 +67,14 @@ var _ = Describe("Exporter.NewServer", func() {
 
 	Context("when a client sends its headers and then stalls on the body", func() {
 		const budget = 200 * time.Millisecond
+		// window is how long both specs below watch the connection. Sharing it
+		// is what makes the twin meaningful: it holds the connection open for
+		// every moment at which the first spec would accept a close, so the
+		// read budget is the only thing that can account for one.
+		const window = 10 * budget
+		// unrelated is the write and idle budget, kept far outside window so
+		// neither deadline can coincide with what the specs observe.
+		const unrelated = 30 * time.Second
 
 		// stall serves the exporter with the given read budget, then sends a
 		// request that promises a body it never finishes. It returns a channel
@@ -76,8 +84,8 @@ var _ = Describe("Exporter.NewServer", func() {
 			srv := exporter.NewServerWithTimeoutsForTest("", httpserver.Timeouts{
 				ReadHeader: budget,
 				Read:       read,
-				Write:      5 * time.Second,
-				Idle:       5 * time.Second,
+				Write:      unrelated,
+				Idle:       unrelated,
 			})
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			Expect(err).NotTo(HaveOccurred())
@@ -108,7 +116,7 @@ var _ = Describe("Exporter.NewServer", func() {
 
 		It("disconnects it within the read budget", func() {
 			closed, got := stall(budget)
-			Eventually(closed).Within(5 * time.Second).Should(BeClosed())
+			Eventually(closed).Within(window).Should(BeClosed())
 			// The request was well formed and served: the disconnect is the
 			// read budget expiring, not the server rejecting the request.
 			Expect(got.String()).To(HavePrefix("HTTP/1.1 200 OK"))
@@ -116,11 +124,11 @@ var _ = Describe("Exporter.NewServer", func() {
 
 		// The twin: identical but for the read budget, which leaves only
 		// ReadHeaderTimeout -- the state #452 reported. It proves the fixture
-		// can still observe a stall, so the spec above cannot pass because the
-		// connection would have closed anyway.
+		// can still observe a stall across the whole window, so the spec above
+		// cannot pass because the connection would have closed anyway.
 		It("holds it open past the header budget when there is no read budget", func() {
 			closed, _ := stall(0)
-			Consistently(closed).WithTimeout(5 * budget).ShouldNot(BeClosed())
+			Consistently(closed).WithTimeout(window).ShouldNot(BeClosed())
 		})
 	})
 })

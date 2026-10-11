@@ -59,9 +59,14 @@ func Defaults() Timeouts {
 	}
 }
 
-// New builds an *http.Server for handler on addr, bounded by t. The server is
-// built here, rather than t being copied onto one the caller built, so the
-// literal names every timeout where gosec's slowloris check can see it.
+// New builds an *http.Server for handler on addr, bounded by t. A zero field
+// in t leaves that phase unbounded, so production callers pass Defaults.
+//
+// The server is built here, rather than t being copied onto one the caller
+// built, because gosec's slowloris check (G112) reads only the struct literal.
+// It checks that ReadHeaderTimeout is named, not what value it is given, so
+// it is satisfied here for good and says nothing about what New's callers
+// pass. The specs on each listener pin the values instead.
 func New(addr string, handler http.Handler, t Timeouts) *http.Server {
 	return &http.Server{
 		Addr:              addr,
