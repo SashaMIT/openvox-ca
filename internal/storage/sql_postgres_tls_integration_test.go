@@ -245,6 +245,25 @@ var _ = Describe("Postgres TLS", Serial, func() {
 		})
 
 		verifiesTheServer()
+
+		// pgdriver dials a TCP host= in preference to the URL's host, so
+		// that is the name to verify: with the URL naming a decoy, only a
+		// ServerName taken from what is dialled can succeed.
+		It("verifies the host= it dials, not the URL's host", func() {
+			servePostgresTLS(postgresDSNFromEnv(), trusted, host)
+			u := *dsn
+			u.Host = "decoy.invalid:5432"
+			q := u.Query()
+			q.Set("host", dsn.Host)
+			q.Set("sslmode", "require")
+			u.RawQuery = q.Encode()
+			tlsCfg, err := loadSQLTLS(SQLSpec{TLSCAFile: caFile})
+			Expect(err).NotTo(HaveOccurred())
+			b, err := NewSQLBackend(SQLConfig{Dialect: SQLPostgres, DSN: u.String(), TLS: tlsCfg})
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = b.Close() })
+			Expect(b.db.PingContext(context.Background())).To(Succeed())
+		})
 	})
 
 	Context("via the DSN's sslmode=verify-full", func() {
