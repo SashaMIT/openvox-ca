@@ -444,6 +444,8 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 		lapseWindow = 3 * shortTTL * time.Second
 	)
 
+	errInjected := errors.New("injected failure")
+
 	var (
 		cli        *clientv3.Client
 		stopServer func()
@@ -517,7 +519,8 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 		}
 		var res acquired
 
-		BeforeEach(func() {
+		// Just-before, so a nested Context can install a hook first.
+		JustBeforeEach(func() {
 			// Long enough that the orphaned lease, and the waiter key it
 			// carries, outlive everything the specs below assert.
 			a.lockTTL = 10
@@ -581,6 +584,53 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(currentSession(a).Done()).NotTo(BeClosed())
 		})
+
+		Context("and giving the key back fails too", func() {
+			BeforeEach(func() {
+				a.unlockHook = func() error { return errInjected }
+			})
+
+			It("reports both failures, and frees this backend's process-local lock on the name", func() {
+				Expect(res.err).To(MatchError(concurrency.ErrSessionExpired))
+				Expect(res.err).To(MatchError(errInjected))
+
+				// The stranded key outlives this window on its orphaned
+				// lease, so the attempt must time out in the distributed
+				// wait; held locally, it would never return at all.
+				ch := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+					_, err := a.AcquireLock(ctx, "crl")
+					ch <- err
+				}()
+				var err error
+				Eventually(ch).WithTimeout(5*time.Second).Should(Receive(&err),
+					"the retry on the lapsed session kept this backend's process-local lock on crl")
+				Expect(err).To(MatchError(context.DeadlineExceeded))
+			})
+		})
+	})
+
+	Context("when an acquisition fails with its key already on the server", func() {
+		BeforeEach(func() {
+			// Long enough that the key could not lapse on its own within
+			// the window below.
+			a.lockTTL = 10
+			var once sync.Once
+			a.lockHook = func() error {
+				var err error
+				once.Do(func() { err = errInjected })
+				return err
+			}
+		})
+
+		It("deletes the key, so other replicas need not wait for this one to take the name again", func() {
+			_, err := a.AcquireLock(context.Background(), "subject:abandoned")
+			Expect(err).To(MatchError(errInjected))
+
+			Expect(otherAcquires("subject:abandoned", time.Second)).To(Succeed())
+		})
 	})
 
 	It("grants production leases with the documented TTL", func() {
@@ -607,7 +657,6 @@ var _ = Describe("EtcdBackendLockSessionLifetime", func() {
 	})
 
 	Context("when deleting the lock key fails", func() {
-		errInjected := errors.New("injected delete failure")
 		var (
 			failing atomic.Bool
 			ul      Unlocker

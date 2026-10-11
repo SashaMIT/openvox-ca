@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -93,9 +94,12 @@ type EtcdBackend struct {
 	importBatchHook  func()
 	mutateRecordHook func()
 	// unlockHook, when non-nil, runs before each attempt to delete a lock
-	// key; an error from it stands in for a failed delete. Test seam only:
-	// it drives the release-retry path without an etcd outage.
+	// key; an error from it stands in for a failed delete. lockHook, when
+	// non-nil, runs once the mutex is won; an error from it stands in for
+	// a Lock that failed with its key already on the server. Test seams
+	// only: they drive the cleanup paths without an etcd outage.
 	unlockHook func() error
+	lockHook   func() error
 
 	// session is the lease-backed concurrency session used for distributed
 	// mutexes. It is created lazily on the first AcquireLock call and
@@ -467,9 +471,20 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 		return nil, err
 	}
 	mu := concurrency.NewMutex(sess, b.prefix+"/locks/"+name)
-	if err := mu.Lock(ctx); err != nil {
-		local.Unlock()
-		return nil, fmt.Errorf("locking %q: %w", name, err)
+	if err := b.lockMutex(ctx, mu); err != nil {
+		// Lock can fail with this session's key still on the server: a
+		// commit whose answer is lost to the caller's deadline leaves the
+		// key with no revision Mutex.Unlock will act on, and Lock's own
+		// cleanup delete can fail. On a lease this backend keeps renewing,
+		// that key would queue every other replica behind it, so delete it
+		// directly, under the same retry as a failed release. The key is
+		// the one tryAcquire writes: the mutex prefix, then the lease ID.
+		key := fmt.Sprintf("%s/locks/%s/%x", b.prefix, name, sess.Lease())
+		ul := b.newUnlocker(sess, key, func(ctx context.Context) error {
+			_, err := b.client.Delete(ctx, key)
+			return err
+		}, local)
+		return nil, fmt.Errorf("locking %q: %w", name, errors.Join(err, ul.Unlock()))
 	}
 	// Lock only checks that its key still exists, which it does until the
 	// lease expires on the server, so it can succeed on a session whose
@@ -478,15 +493,28 @@ func (b *EtcdBackend) AcquireLock(ctx context.Context, name string) (Unlocker, e
 	// within the TTL. Give the key back and refuse instead.
 	select {
 	case <-sess.Done():
-		ul := b.newUnlocker(sess, mu, local)
+		ul := b.newUnlocker(sess, mu.Key(), mu.Unlock, local)
 		return nil, fmt.Errorf("locking %q: %w", name, errors.Join(concurrency.ErrSessionExpired, ul.Unlock()))
 	default:
 	}
-	return b.newUnlocker(sess, mu, local), nil
+	return b.newUnlocker(sess, mu.Key(), mu.Unlock, local), nil
 }
 
-func (b *EtcdBackend) newUnlocker(sess *concurrency.Session, mu *concurrency.Mutex, local *sync.Mutex) *etcdUnlocker {
-	return &etcdUnlocker{sess: sess, mu: mu, local: local, timeout: b.timeout, hook: b.unlockHook}
+// lockMutex takes mu, then runs lockHook.
+func (b *EtcdBackend) lockMutex(ctx context.Context, mu *concurrency.Mutex) error {
+	if err := mu.Lock(ctx); err != nil {
+		return err
+	}
+	if b.lockHook != nil {
+		return b.lockHook()
+	}
+	return nil
+}
+
+// newUnlocker returns an unlocker that releases key by calling del, and then
+// the process-local mutex.
+func (b *EtcdBackend) newUnlocker(sess *concurrency.Session, key string, del func(context.Context) error, local *sync.Mutex) *etcdUnlocker {
+	return &etcdUnlocker{sess: sess, key: key, del: del, local: local, timeout: b.timeout, hook: b.unlockHook}
 }
 
 // localLockFor returns the process-local mutex for lock name, creating it
@@ -554,7 +582,8 @@ const etcdUnlockRetryInterval = 500 * time.Millisecond
 // local mutex anyway.
 type etcdUnlocker struct {
 	sess    *concurrency.Session
-	mu      *concurrency.Mutex
+	key     string
+	del     func(context.Context) error
 	local   *sync.Mutex
 	timeout time.Duration
 	hook    func() error
@@ -578,7 +607,7 @@ func (u *etcdUnlocker) release() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), u.timeout)
 	defer cancel()
-	return u.mu.Unlock(ctx)
+	return u.del(ctx)
 }
 
 // retryRelease retries release until it succeeds or the session lapses,
@@ -590,10 +619,12 @@ func (u *etcdUnlocker) retryRelease() {
 	for {
 		select {
 		case <-u.sess.Done():
+			slog.Warn("Stopped retrying a distributed lock release: the session has lapsed, and the key with it", "key", u.key)
 			return
 		case <-t.C:
 		}
 		if u.release() == nil {
+			slog.Info("Released distributed lock after retrying", "key", u.key)
 			return
 		}
 	}
@@ -609,7 +640,9 @@ func (b *EtcdBackend) Close() error {
 		// under it, and a cancelled one would leave every lock this
 		// backend holds to wait out the TTL instead. The revoke waits for
 		// etcd for up to the TTL, though, so cut it off at the request
-		// timeout: a shutdown during an outage must not outlast the drain.
+		// timeout. That still runs after the HTTP drain, so during an
+		// outage it can outlast the launcher's shutdown headroom; the
+		// lease then lapses on its TTL, as it would have anyway.
 		stop := time.AfterFunc(b.timeout, b.sessionCancel)
 		_ = b.session.Close()
 		stop.Stop()

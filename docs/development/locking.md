@@ -192,7 +192,9 @@ that creates it is only its first user: the caller's context bounds the lease
 grant and nothing else, and the keepalive runs on a context that only `Close`
 cancels. `Close` revokes the lease before cancelling it, so locks the backend
 still holds free at once, and gives up after the request timeout if etcd cannot
-be reached. Passing the caller's context to `concurrency.WithContext`, as the
+be reached. That wait comes after the HTTP drain, so during an outage it can
+outlast the launcher's shutdown headroom; the lease then lapses on its TTL.
+Passing the caller's context to `concurrency.WithContext`, as the
 session once did, stops the keepalive when that request returns, and every
 other lock on the session lapses one TTL later, part-way through its
 read-modify-write ([#442](https://github.com/voxpupuli/openvox-ca/issues/442)).
@@ -205,12 +207,18 @@ rule 6 of [Rules for new or changed code](#rules-for-new-or-changed-code)
 covers that.
 
 A lease that outlives requests also means a lock key no longer lapses on its
-own when releasing it fails. If the delete fails (an etcd stall longer than the
-request timeout, say) the key stays on a lease the backend goes on renewing,
-and every other replica would wait for it until this one next took the same
-name. So `etcdUnlocker` retries the delete in the background until it succeeds
+own when the backend fails to delete it. If a release fails (an etcd stall
+longer than the request timeout, say) the key stays on a lease the backend goes
+on renewing, and every other replica would wait for it until this one next took
+the same name. A failed *acquisition* can leave the same thing behind: a
+commit whose answer is lost to the caller's deadline puts the waiter key on the
+server without giving `Mutex.Unlock` a revision to act on, so `AcquireLock`
+deletes this session's key itself whenever `Lock` fails. Both go through
+`etcdUnlocker`, which retries the delete in the background until it succeeds
 or the session stops renewing, which lets the lease and the key lapse within
-the TTL. It holds the per-name process-local mutex until then, because a
+the TTL. A put still in flight when that delete lands can strand the key
+regardless; that needs a lost commit and a stall together, and it ends when
+this replica next takes the name. It holds the per-name process-local mutex until then, because a
 re-acquisition by the same backend reuses the very same key, and a retry
 landing after it would delete a live lock. In-process callers of that name
 therefore wait out the stall, and like every wait on that mutex they ignore
