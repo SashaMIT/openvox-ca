@@ -119,11 +119,28 @@ extraEnv:
         name: openvox-ca-db
         key: password
   - name: PUPPET_CA_SQL_DSN
-    value: postgres://openvox-ca:$(POSTGRES_PASSWORD)@db-rw:5432/openvox-ca?sslmode=require
+    value: postgres://openvox-ca:$(POSTGRES_PASSWORD)@db-rw:5432/openvox-ca?sslmode=verify-full&sslrootcert=/run/secrets/openvox-ca-db-ca/ca.crt
+extraVolumes:
+  - name: db-ca
+    secret:
+      secretName: openvox-ca-db-ca
+      items:
+        - key: ca.crt
+          path: ca.crt
+extraVolumeMounts:
+  - name: db-ca
+    mountPath: /run/secrets/openvox-ca-db-ca
+    readOnly: true
 ```
 
 Environment variables take precedence over the config file, which is what makes
 this work.
+
+`sslmode=verify-full` checks that the database's certificate was issued by the
+CA in `sslrootcert` and names the host in the DSN, so mount that CA alongside.
+`sslmode=require` would encrypt the connection without verifying the server; see
+[the PostgreSQL backend](storage-backends.md#postgresql-backend). Project only
+the CA certificate, as above, when the Secret also holds the CA's key.
 
 ## Choosing an image
 

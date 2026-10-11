@@ -648,25 +648,41 @@ can share it. `postgres`, `postgresql` and `pg` are accepted as aliases.
 # /etc/puppet-ca/config.yaml
 storage_backend: postgres
 cadir: /var/lib/puppet-ca                # still needed for per-subject keys
-sql_dsn: "postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=require"
+sql_dsn: "postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=verify-full&sslrootcert=/etc/puppet-ca/pg-ca.pem"
 
 sql_request_timeout_sec: 10              # per-operation timeout (default 10)
 sql_migration_timeout_sec: 600           # whole schema-migration run (default 600)
 sql_max_open_conns: 0                    # 0 = database/sql default; min 4 when set
 sql_max_idle_conns: 0                    # 0 = database/sql default
 
-# Optional mTLS to PostgreSQL (alternative to sslmode/ssl params in the DSN).
+# Optional: TLS from files instead of the DSN's ssl* parameters. Always
+# verifies the server, as sslmode=verify-full does; see below.
 sql_tls_ca_file:   /etc/puppet-ca/pg-ca.pem
 sql_tls_cert_file: /etc/puppet-ca/pg-client.pem
 sql_tls_key_file:  /etc/puppet-ca/pg-client-key.pem
 ```
 
-TLS is driven either by the DSN (`sslmode=require`, etc.) or by the
-`sql_tls_*_file` options.
+TLS is driven either by the DSN's `sslmode` and `sslrootcert` parameters or by
+the `sql_tls_*_file` options. In the DSN, use `sslmode=verify-full`: it encrypts
+the connection, checks the server's certificate against `sslrootcert`, and
+checks that the certificate names the host in the DSN. `sslmode=require`
+encrypts the connection but does not verify the server's certificate at all,
+and `verify-ca` checks the certificate without checking the host name; with
+`sslrootcert` present, `require` behaves as `verify-ca`. PostgreSQL's
+[SSL mode table](https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-SSLMODE-STATEMENTS)
+sets out what each mode protects against.
+
+Setting any `sql_tls_*_file` option replaces the DSN's TLS settings, `sslmode`
+included. The connection then always uses TLS and always verifies the server
+as `verify-full` does: its certificate must chain to `sql_tls_ca_file` (or to
+the system's trusted CAs, when only a client certificate is given) and must
+name the host the DSN connects to. These options need a single TCP host, so
+`openvox-ca` refuses to open the database with them alongside a Unix-socket
+DSN, which PostgreSQL does not serve over TLS, or a DSN naming several hosts.
 
 ```text
 --storage-backend postgres
---sql-dsn         postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=require
+--sql-dsn         'postgres://puppetca:secret@db.example.com:5432/puppetca?sslmode=verify-full&sslrootcert=/etc/puppet-ca/pg-ca.pem'
 ```
 
 **Operational notes.** Back the database up with your normal PostgreSQL tooling.
