@@ -34,7 +34,13 @@ var _ = Describe("PostgreSQL sql_tls_* configuration", func() {
 		// host; empty them so the runner's environment cannot move the answer.
 		GinkgoT().Setenv("PGHOST", "")
 		GinkgoT().Setenv("PGPORT", "")
-		base = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: x509.NewCertPool()}
+		// Every field loadBackendTLS can set, so a refactor that rebuilds the
+		// config rather than cloning it cannot drop one unnoticed.
+		base = &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			RootCAs:      x509.NewCertPool(),
+			Certificates: []tls.Certificate{{Certificate: [][]byte{{1}}}},
+		}
 	})
 
 	// configFor parses dsn exactly as openSQLDB does.
@@ -49,6 +55,8 @@ var _ = Describe("PostgreSQL sql_tls_* configuration", func() {
 			Expect(conf.TLSConfig.ServerName).To(Equal(want))
 			Expect(conf.TLSConfig.InsecureSkipVerify).To(BeFalse())
 			Expect(conf.TLSConfig.RootCAs).To(BeIdenticalTo(base.RootCAs))
+			Expect(conf.TLSConfig.Certificates).To(Equal(base.Certificates))
+			Expect(conf.TLSConfig.MinVersion).To(Equal(base.MinVersion))
 		},
 		Entry("a hostname", "postgres://u:p@db.example.com:5432/ca", "db.example.com"),
 		Entry("a hostname on the default port", "postgres://u:p@db.example.com/ca", "db.example.com"),
